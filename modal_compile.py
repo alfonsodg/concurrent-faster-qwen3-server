@@ -11,23 +11,20 @@ app = modal.App("qwen3-tts-compile")
 image = (
     modal.Image.from_registry("nvidia/cuda:12.6.3-devel-ubuntu24.04", add_python="3.12")
     .apt_install("cmake", "pkg-config", "libssl-dev", "libasound2-dev",
-                 "libclang-dev", "clang", "curl")
+                 "libclang-dev", "clang", "curl", "git")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
     )
+    .add_local_dir(".", remote_path="/src", ignore=[
+        "target", "models", "__pycache__", ".git",
+        "*.wav", "*.gguf", "*.onnx", "*.pyc",
+    ])
 )
 
 vol = modal.Volume.from_name("tts-compiled", create_if_missing=True)
-src_mount = modal.Mount.from_local_dir(
-    ".", remote_path="/src",
-    condition=lambda p: not any(x in p for x in ["target/", "models/", "__pycache__", ".git/"]),
-)
 
 
-@app.function(
-    image=image, gpu="H100", timeout=2400, memory=65536,
-    mounts=[src_mount], volumes={"/out": vol},
-)
+@app.function(image=image, gpu="H100", timeout=2400, memory=65536, volumes={"/out": vol})
 def compile():
     import subprocess, os, shutil
 
@@ -50,26 +47,25 @@ def compile():
 
     binary = "/src/target/release/qwen3-tts-server"
     if not os.path.exists(binary):
-        print("Binary not found at expected path, checking...")
-        for f in os.listdir("/src/target/release/"):
-            if not f.startswith(".") and os.access(f"/src/target/release/{f}", os.X_OK):
-                print(f"  executable: {f}")
+        print("Binary not found, listing executables...")
+        for f in sorted(os.listdir("/src/target/release/")):
+            fp = f"/src/target/release/{f}"
+            if os.path.isfile(fp) and os.access(fp, os.X_OK) and not f.endswith(".d"):
+                print(f"  {f} ({os.path.getsize(fp)/1024/1024:.1f}MB)")
         return {"error": "binary not found"}
 
     size = os.path.getsize(binary)
     print(f"Binary size: {size / 1024 / 1024:.1f} MB")
 
-    # Copy to volume
     shutil.copy2(binary, "/out/qwen3-tts-server")
     vol.commit()
-    print("Binary saved to volume tts-compiled:/qwen3-tts-server")
+    print("Saved to volume tts-compiled:/qwen3-tts-server")
 
     return {"status": "ok", "size_mb": round(size / 1024 / 1024, 1)}
 
 
 @app.function(image=image, volumes={"/out": vol})
 def download():
-    """Return the compiled binary bytes for local download."""
     with open("/out/qwen3-tts-server", "rb") as f:
         return f.read()
 
