@@ -415,6 +415,83 @@ impl CodePredictor {
         Ok(all_codes)
     }
 
+    /// Batched acoustic code generation: process N sequences in parallel.
+    /// talker_hiddens: [N, 1, hidden], semantic_embeds: [N, 1, hidden]
+    /// Returns: Vec of [15] tensors, one per sequence.
+    pub fn generate_acoustic_codes_batched(
+        &self,
+        talker_hiddens: &Tensor,
+        semantic_embeds: &Tensor,
+    ) -> Result<Vec<Tensor>> {
+        let n = talker_hiddens.dim(0)?;
+        let device = talker_hiddens.device();
+        let num_acoustic = self.config.num_code_groups - 1;
+
+        // Prefill: [N, 2, hidden]
+        let input = Tensor::cat(&[talker_hiddens, semantic_embeds], 1)?;
+        let input = if let Some(proj) = &self.small_to_mtp_projection {
+            proj.forward(&input)?
+        } else { input };
+
+        let seq_len = input.dim(1)?;
+        let mask = self.create_causal_mask(seq_len, device)?;
+
+        // Fresh KV caches for batched inference (concat-based)
+        let num_layers = self.layers.len();
+        let mut kv_caches: Vec<AnyKVCache> = (0..num_layers)
+            .map(|_| AnyKVCache::Concat(super::kv_cache::KVCache::new()))
+            .collect();
+
+        let mut hidden = input;
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &self.rope, Some(&mask), Some(&mut kv_caches[i]), 0)?;
+        }
+        hidden = self.norm.forward(&hidden)?;
+
+        // First acoustic code: [N, 1, hidden] -> [N, 1, vocab] -> argmax -> [N]
+        let last_hidden = hidden.i((.., seq_len - 1..seq_len, ..))?;
+        let logits = self.lm_heads[0].forward(&last_hidden)?;
+        let first_codes = logits.argmax(D::Minus1)?.squeeze(1)?; // [N]
+
+        // Store all codes: [N, 15]
+        let mut all_codes = Tensor::zeros((n, num_acoustic), candle_core::DType::U32, device)?;
+        all_codes = all_codes.slice_assign(&[0..n, 0..1], &first_codes.unsqueeze(1)?)?;
+
+        let mut prev_codes = first_codes;
+        let mut offset = seq_len;
+
+        // Autoregressive: 14 more codes, all N sequences in parallel
+        for group_idx in 1..num_acoustic {
+            let code_embed = self.codec_embeddings[group_idx - 1].forward(&prev_codes)?;
+            let code_embed = code_embed.unsqueeze(1)?; // [N, 1, embed]
+            let code_embed = if let Some(proj) = &self.small_to_mtp_projection {
+                proj.forward(&code_embed)?
+            } else { code_embed };
+
+            let mut h = code_embed;
+            for (i, layer) in self.layers.iter().enumerate() {
+                h = layer.forward(&h, &self.rope, None, Some(&mut kv_caches[i]), offset)?;
+            }
+            h = self.norm.forward(&h)?;
+
+            let logits = self.lm_heads[group_idx].forward(&h)?;
+            let next_codes = logits.argmax(D::Minus1)?.squeeze(1)?; // [N]
+            all_codes = all_codes.slice_assign(
+                &[0..n, group_idx..group_idx + 1],
+                &next_codes.unsqueeze(1)?,
+            )?;
+            prev_codes = next_codes;
+            offset += 1;
+        }
+
+        // Split into per-sequence tensors
+        let mut results = Vec::with_capacity(n);
+        for i in 0..n {
+            results.push(all_codes.i(i)?);
+        }
+        Ok(results)
+    }
+
     fn create_causal_mask(&self, seq_len: usize, device: &candle_core::Device) -> Result<Tensor> {
         super::transformer::create_causal_mask(seq_len, 0, device)
     }

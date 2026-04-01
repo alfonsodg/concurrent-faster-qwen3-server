@@ -1219,25 +1219,42 @@ impl Qwen3TTS {
             }
             if done.iter().all(|&d| d) { break; }
 
-            // Per-sequence: code predictor + build step input
+            // BATCHED code predictor: all active sequences in one pass
+            let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
+
+            // Stack semantic embeddings for active sequences
+            let active_semantic_embeds: Vec<Tensor> = active.iter()
+                .map(|&i| self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i]))
+                .collect::<Result<Vec<_>>>()?;
+            let active_hiddens: Vec<Tensor> = active.iter()
+                .map(|&i| last_hiddens[i].clone())
+                .collect();
+
+            let batched_hiddens = Tensor::cat(&active_hiddens, 0)?;
+            let batched_sem_embeds = Tensor::cat(&active_semantic_embeds, 0)?;
+
+            let batched_acoustic = self.code_predictor.generate_acoustic_codes_batched(
+                &batched_hiddens, &batched_sem_embeds,
+            )?;
+
+            // Build step inputs from batched results
             let mut step_inputs: Vec<Tensor> = Vec::with_capacity(n);
+            let mut active_idx = 0;
             for i in 0..n {
                 if done[i] {
-                    // Dummy input for done sequences (will be masked)
                     step_inputs.push(Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?);
                     continue;
                 }
 
-                let semantic_embed = self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i])?;
-                let acoustic_codes = self.code_predictor.generate_acoustic_codes(
-                    &last_hiddens[i], &semantic_embed, &mut cp_kv_caches[i],
-                )?;
+                let acoustic_codes = &batched_acoustic[active_idx];
+                let semantic_embed = &active_semantic_embeds[active_idx];
+                active_idx += 1;
 
-                let frame_tensor = Tensor::cat(&[&semantic_tokens[i].reshape(1)?, &acoustic_codes], 0)?;
+                let frame_tensor = Tensor::cat(&[&semantic_tokens[i].reshape(1)?, acoustic_codes], 0)?;
                 let frame_vec: Vec<u32> = frame_tensor.to_vec1()?;
                 all_codes[i].push(frame_vec);
 
-                let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(&acoustic_codes)?;
+                let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(acoustic_codes)?;
                 let summed = semantic_embed.add(&acoustic_sum)?;
 
                 let text_addition = if frame_idx < all_trailing_len[i] {
