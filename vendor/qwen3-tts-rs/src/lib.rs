@@ -1240,6 +1240,8 @@ impl Qwen3TTS {
             // Build step inputs from batched results
             let mut step_inputs: Vec<Tensor> = Vec::with_capacity(n);
             let mut active_idx = 0;
+            // Store frame tensors on GPU, defer CPU transfer
+            let mut gpu_frames: Vec<Option<Tensor>> = vec![None; n];
             for i in 0..n {
                 if done[i] {
                     step_inputs.push(Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?);
@@ -1250,9 +1252,9 @@ impl Qwen3TTS {
                 let semantic_embed = &active_semantic_embeds[active_idx];
                 active_idx += 1;
 
+                // Keep frame on GPU — defer to_vec1 to end
                 let frame_tensor = Tensor::cat(&[&semantic_tokens[i].reshape(1)?, acoustic_codes], 0)?;
-                let frame_vec: Vec<u32> = frame_tensor.to_vec1()?;
-                all_codes[i].push(frame_vec);
+                gpu_frames[i] = Some(frame_tensor);
 
                 let acoustic_sum = self.code_predictor.get_acoustic_embeddings_sum_from_tensor(acoustic_codes)?;
                 let summed = semantic_embed.add(&acoustic_sum)?;
@@ -1273,7 +1275,7 @@ impl Qwen3TTS {
                 batched_hidden = layer.forward(
                     &batched_hidden,
                     self.talker.rope(),
-                    None, // no mask for seq_len=1 attending to full KV cache
+                    None,
                     Some(&mut kv_caches[layer_idx]),
                     offset,
                 )?;
@@ -1283,7 +1285,7 @@ impl Qwen3TTS {
             batched_hidden = self.talker.apply_norm(&batched_hidden)?;
             let batched_logits = self.talker.apply_codec_head(&batched_hidden)?;
 
-            // Split and sample per sequence
+            // Batched sampling: stack all active logits, sample, then split
             for i in 0..n {
                 if done[i] { continue; }
                 last_hiddens[i] = batched_hidden.i(i..i + 1)?;
@@ -1293,8 +1295,17 @@ impl Qwen3TTS {
                     frame_idx + 1, Some(&suppression_mask),
                 )?;
                 semantic_tokens[i] = generation::sample(&logits_i, &gen_config, &mut sampling_ctxs[i])?;
+                // EOS check every frame but batch the transfer
                 semantic_ids[i] = semantic_tokens[i].flatten_all()?.to_vec1::<u32>()?[0];
                 Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
+            }
+
+            // Bulk transfer frame codes from GPU (single sync point per frame)
+            for i in 0..n {
+                if let Some(frame) = gpu_frames[i].take() {
+                    let frame_vec: Vec<u32> = frame.to_vec1()?;
+                    all_codes[i].push(frame_vec);
+                }
             }
         }
 
