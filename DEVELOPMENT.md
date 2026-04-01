@@ -108,6 +108,7 @@ Streaming TTFA (Time To First Audio): ~761ms (single sequence).
 | `7469300` | Arc shared model weights | VRAM 5174→2734 MB idle |
 | `49ccef4` | Pre-allocate zero tensor | Minor allocation reduction |
 | `18ce1e9` | Voice cloning in batch mode + busy-wait fix (10ms) | Batch=8: 9.56x → 9.98x RT, voice clone no longer falls back to sequential |
+| `31acfab` | Batched streaming worker (up to 8 concurrent streams) | Streaming uses `synthesize_batch_streaming`, decodes every 10 frames |
 
 ### Failed experiments
 
@@ -170,7 +171,7 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
 ### P0 — Critical for production
 
-1. **Incremental batched streaming** — `streaming.rs` currently calls `synthesize_batch()` and sends all audio at once. Need to modify `synthesize_batch()` in `lib.rs` to yield per-frame, decode vocoder incrementally, and send PCM chunks through channels as they're produced. This would give batched TTFA instead of waiting for full generation.
+1. ~~**Incremental batched streaming**~~ ✅ `31acfab` — Streaming worker now uses `synthesize_batch_streaming()`. Collects up to 8 concurrent stream requests within 50ms window, runs batched generation, decodes and sends PCM chunks every 10 frames (~800ms). Single request has no added latency (batch=1).
 
 2. ~~**Voice cloning in batch mode**~~ ✅ `18ce1e9` — `synthesize_batch_with_voices()` accepts per-request `VoiceClonePrompt`. Mixed batches (some clone, some Serena) supported. `BatchEngine` creates prompts from ref_audio and passes to batch API.
 
@@ -183,7 +184,7 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
 4. ~~**BlockingRecvTimeout busy-wait**~~ ✅ `18ce1e9` — Replaced 1ms busy-wait poll with 10ms OS sleep.
 
-5. **Streaming worker is single-threaded** — `start_streaming_worker()` spawns one thread, processes one stream at a time. Should pool or integrate with batch engine.
+5. ~~**Streaming worker is single-threaded**~~ ✅ `31acfab` — Now batches up to 8 concurrent streams with forwarding threads per request.
 
 6. **WAV header data length** — Streaming sends `0xFFFFFFFF` as data length. Some players may not handle this. Consider sending correct length after generation or using raw PCM with content-length.
 
