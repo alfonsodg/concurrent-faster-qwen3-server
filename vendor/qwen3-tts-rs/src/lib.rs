@@ -1141,11 +1141,9 @@ impl Qwen3TTS {
         let attn_mask = self.build_batched_causal_mask(&attention_masks, max_prefill_len)?;
 
         // Phase 2: Batched prefill through transformer
-        // Use concat KV caches (not pre-alloc) since batch > 1
-        let num_layers = self.talker.layers_iter().count();
-        let mut kv_caches: Vec<models::transformer::AnyKVCache> = (0..num_layers)
-            .map(|_| models::transformer::AnyKVCache::Concat(models::kv_cache::KVCache::new()))
-            .collect();
+        // Use pre-allocated KV caches with batch=N for zero-copy CUDA writes
+        let max_gen = gen_config.max_new_tokens;
+        let mut kv_caches = self.talker.new_kv_caches_batched(n, max_gen + max_prefill_len + 16);
 
         let mut hidden = batched_embed;
         for (i, layer) in self.talker.layers_iter().enumerate() {
@@ -1285,27 +1283,54 @@ impl Qwen3TTS {
             batched_hidden = self.talker.apply_norm(&batched_hidden)?;
             let batched_logits = self.talker.apply_codec_head(&batched_hidden)?;
 
-            // Batched sampling: stack all active logits, sample, then split
+            // Sample per sequence (penalties are per-sequence so can't fully batch)
+            let mut new_tokens: Vec<Tensor> = Vec::with_capacity(n);
             for i in 0..n {
-                if done[i] { continue; }
+                if done[i] {
+                    new_tokens.push(semantic_tokens[i].clone());
+                    continue;
+                }
                 last_hiddens[i] = batched_hidden.i(i..i + 1)?;
                 let logits_i = batched_logits.i(i..i + 1)?.squeeze(1)?;
                 let logits_i = self.apply_generation_penalties_gpu(
                     &logits_i, &penalty_masks[i], &gen_config,
                     frame_idx + 1, Some(&suppression_mask),
                 )?;
-                semantic_tokens[i] = generation::sample(&logits_i, &gen_config, &mut sampling_ctxs[i])?;
-                // EOS check every frame but batch the transfer
-                semantic_ids[i] = semantic_tokens[i].flatten_all()?.to_vec1::<u32>()?[0];
-                Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
+                let tok = generation::sample(&logits_i, &gen_config, &mut sampling_ctxs[i])?;
+                new_tokens.push(tok);
             }
 
-            // Bulk transfer frame codes from GPU (single sync point per frame)
+            // Batched EOS check: stack all tokens → single GPU→CPU transfer
+            let stacked = Tensor::stack(&new_tokens, 0)?.flatten_all()?;
+            let all_ids: Vec<u32> = stacked.to_vec1()?;
             for i in 0..n {
-                if let Some(frame) = gpu_frames[i].take() {
-                    let frame_vec: Vec<u32> = frame.to_vec1()?;
-                    all_codes[i].push(frame_vec);
+                semantic_tokens[i] = new_tokens[i].clone();
+                semantic_ids[i] = all_ids[i];
+                if !done[i] {
+                    Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
                 }
+            }
+
+            // Bulk transfer frame codes (single sync)
+            if !gpu_frames.iter().all(|f| f.is_none()) {
+                let mut to_transfer: Vec<(usize, &Tensor)> = Vec::new();
+                for i in 0..n {
+                    if let Some(ref frame) = gpu_frames[i] {
+                        to_transfer.push((i, frame));
+                    }
+                }
+                if !to_transfer.is_empty() {
+                    let stacked_frames = Tensor::stack(
+                        &to_transfer.iter().map(|(_, f)| *f).collect::<Vec<_>>(), 0
+                    )?;
+                    let all_frame_data: Vec<u32> = stacked_frames.flatten_all()?.to_vec1()?;
+                    let codes_per_frame = 16;
+                    for (idx, (i, _)) in to_transfer.iter().enumerate() {
+                        let start = idx * codes_per_frame;
+                        all_codes[*i].push(all_frame_data[start..start + codes_per_frame].to_vec());
+                    }
+                }
+                for f in gpu_frames.iter_mut() { *f = None; }
             }
         }
 

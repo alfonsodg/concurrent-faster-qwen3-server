@@ -856,6 +856,20 @@ impl TalkerModel {
         self.get_projected_special_embed(tts_tokens::TTS_PAD)
     }
 
+    /// Create pre-allocated KV caches for batched inference.
+    pub fn new_kv_caches_batched(&self, batch: usize, max_seq: usize) -> Vec<AnyKVCache> {
+        let dtype = self.codec_head.weight().dtype();
+        let num_kv_heads = self.config.num_key_value_heads;
+        let head_dim = self.config.head_dim;
+        (0..self.config.num_hidden_layers)
+            .map(|_| {
+                PreAllocKVCache::new(batch, num_kv_heads, max_seq, head_dim, dtype, &self.device)
+                    .map(AnyKVCache::PreAlloc)
+                    .unwrap_or_else(|_| AnyKVCache::Concat(KVCache::new()))
+            })
+            .collect()
+    }
+
     // Public wrappers for batched inference
     pub fn build_role_prefix_pub(&self) -> Result<Tensor> { self.build_role_prefix() }
     pub fn build_tts_pad_bos_pub(&self, pad_count: usize) -> Result<Tensor> { self.build_tts_pad_bos(pad_count) }
