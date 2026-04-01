@@ -1283,21 +1283,17 @@ impl Qwen3TTS {
             batched_hidden = self.talker.apply_norm(&batched_hidden)?;
             let batched_logits = self.talker.apply_codec_head(&batched_hidden)?;
 
-            // Sample per sequence (penalties are per-sequence so can't fully batch)
+            // Batched greedy sampling: apply suppression + argmax in one pass
+            let logits_2d = batched_logits.squeeze(1)?.to_dtype(candle_core::DType::F32)?; // [N, vocab]
+            let suppressed = generation::apply_token_suppression_with_mask(&logits_2d, &suppression_mask)?;
+            let all_new_tokens = suppressed.argmax(candle_core::D::Minus1)?; // [N]
+
+            // Update per-sequence state
             let mut new_tokens: Vec<Tensor> = Vec::with_capacity(n);
             for i in 0..n {
-                if done[i] {
-                    new_tokens.push(semantic_tokens[i].clone());
-                    continue;
-                }
+                let tok = all_new_tokens.i(i)?;
+                new_tokens.push(tok.clone());
                 last_hiddens[i] = batched_hidden.i(i..i + 1)?;
-                let logits_i = batched_logits.i(i..i + 1)?.squeeze(1)?;
-                let logits_i = self.apply_generation_penalties_gpu(
-                    &logits_i, &penalty_masks[i], &gen_config,
-                    frame_idx + 1, Some(&suppression_mask),
-                )?;
-                let tok = generation::sample(&logits_i, &gen_config, &mut sampling_ctxs[i])?;
-                new_tokens.push(tok);
             }
 
             // Batched EOS check: stack all tokens → single GPU→CPU transfer
