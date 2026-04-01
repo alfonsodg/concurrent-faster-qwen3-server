@@ -101,7 +101,20 @@ impl BatchEngine {
                     .map(|r| (r.text.clone(), r.language, Some(r.options.clone())))
                     .collect();
 
-                match model.synthesize_batch(&requests) {
+                // Build per-request voice clone prompts
+                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = batch
+                    .iter()
+                    .map(|r| {
+                        r.voice_clone.as_ref().and_then(|vc| {
+                            let ref_buf = qwen3_tts::AudioBuffer::load(&vc.ref_audio_path).ok()?;
+                            model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()).ok()
+                        })
+                    })
+                    .collect();
+                let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
+                    prompts.iter().map(|p| p.as_ref()).collect();
+
+                match model.synthesize_batch_with_voices(&requests, &prompt_refs) {
                     Ok(audios) => {
                         let gen_time = t0.elapsed().as_secs_f32();
                         let per_req = gen_time / audios.len() as f32;
@@ -165,23 +178,24 @@ impl BatchEngine {
     }
 }
 
-/// Blocking recv with timeout for std mpsc
+/// Blocking recv with timeout using OS-level sleep instead of busy-wait poll.
 trait BlockingRecvTimeout<T> {
     fn blocking_recv_timeout(&mut self, timeout: std::time::Duration) -> Result<T, ()>;
 }
 
 impl<T> BlockingRecvTimeout<T> for mpsc::Receiver<T> {
     fn blocking_recv_timeout(&mut self, timeout: std::time::Duration) -> Result<T, ()> {
-        // Use tokio's blocking_recv with a manual timeout
-        let start = Instant::now();
+        let deadline = Instant::now() + timeout;
         loop {
             match self.try_recv() {
                 Ok(val) => return Ok(val),
                 Err(mpsc::error::TryRecvError::Empty) => {
-                    if start.elapsed() >= timeout {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         return Err(());
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // Sleep with OS scheduler (no busy-wait), check every 10ms
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => return Err(()),
             }
