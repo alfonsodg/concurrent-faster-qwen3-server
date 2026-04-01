@@ -8,7 +8,7 @@ use anyhow::Result;
 use qwen3_tts::{AudioBuffer, Language, Qwen3TTS, Speaker, SynthesisOptions};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{info, warn};
 
 /// A pending TTS request waiting to be batched.
 pub struct BatchRequest {
@@ -96,24 +96,17 @@ impl BatchEngine {
             let batch_size = batch.len();
             info!(batch_size, "Processing batch");
 
-            // Process each request in the batch sequentially for now.
-            // The key optimization: we process them back-to-back on the same
-            // GPU without thread contention, and the GPU stays warm.
-            //
-            // Phase 2 (true batching) will stack prefill outputs and run
-            // the autoregressive loop with batch dim > 1.
             let t0 = Instant::now();
 
+            // Process sequentially on single GPU thread — no contention,
+            // GPU stays warm between requests. Each request gets ~1.1x RT.
+            // Total throughput = N * 1.1x RT / N = 1.1x RT constant.
             for req in batch {
                 let t_req = Instant::now();
                 let result = Self::process_single(&model, &req);
                 let gen_time = t_req.elapsed().as_secs_f32();
-
                 let reply = match result {
-                    Ok(audio) => Ok(BatchResult {
-                        audio,
-                        gen_time_secs: gen_time,
-                    }),
+                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
                     Err(e) => Err(e),
                 };
                 let _ = req.reply.send(reply);

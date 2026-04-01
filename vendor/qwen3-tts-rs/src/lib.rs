@@ -1050,6 +1050,279 @@ impl Qwen3TTS {
         &self.device
     }
 
+    /// Batched synthesis: process N sequences through a single forward pass per frame.
+    ///
+    /// Each sequence is prefilled independently, then KV caches are stacked
+    /// along the batch dimension for the autoregressive generation loop.
+    /// Returns one AudioBuffer per input.
+    pub fn synthesize_batch(
+        &self,
+        requests: &[(String, Language, Option<SynthesisOptions>)],
+    ) -> Result<Vec<AudioBuffer>> {
+        if requests.is_empty() {
+            return Ok(vec![]);
+        }
+        if requests.len() == 1 {
+            let (text, lang, opts) = &requests[0];
+            let audio = self.synthesize_with_voice(text, Speaker::Serena, *lang, opts.clone())?;
+            return Ok(vec![audio]);
+        }
+
+        let n = requests.len();
+        let opts0 = requests[0].2.clone().unwrap_or_default();
+        let gen_config = opts0.to_gen_config();
+
+        // Phase 1: Prefill each sequence independently, collect state
+        let mut all_kv: Vec<Vec<models::transformer::AnyKVCache>> = Vec::with_capacity(n);
+        let mut all_hidden: Vec<Tensor> = Vec::with_capacity(n);
+        let mut all_logits: Vec<Tensor> = Vec::with_capacity(n);
+        let mut all_trailing: Vec<Tensor> = Vec::with_capacity(n);
+        let mut all_trailing_len: Vec<usize> = Vec::with_capacity(n);
+        let mut all_offsets: Vec<usize> = Vec::with_capacity(n);
+        let mut all_sampling: Vec<generation::SamplingContext> = Vec::with_capacity(n);
+
+        for (text, lang, opts) in requests {
+            let opts = opts.clone().unwrap_or_default();
+            let mut sampling_ctx = generation::SamplingContext::new(opts.seed);
+            let input_ids = self.text_tokenizer.encode(text)?;
+
+            let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
+            let (hidden, logits) = self.talker.prefill_custom_voice(
+                &input_ids,
+                Speaker::Serena,
+                *lang,
+                &mut kv_caches,
+            )?;
+            let prefill_len = hidden.dim(1)?;
+            let last_hidden = hidden.i((.., prefill_len - 1..prefill_len, ..))?;
+            let trailing = self.build_default_trailing_text(&input_ids)?;
+            let trailing_len = trailing.dim(1)?;
+
+            all_kv.push(kv_caches);
+            all_hidden.push(last_hidden);
+            all_logits.push(logits);
+            all_trailing.push(trailing);
+            all_trailing_len.push(trailing_len);
+            all_offsets.push(prefill_len);
+            all_sampling.push(sampling_ctx);
+        }
+
+        let tts_pad_embed = self.talker.get_tts_pad_embed()?;
+        let suppression_mask = generation::build_suppression_mask(
+            codec_tokens::CODEC_VOCAB_SIZE,
+            CODEC_EOS_TOKEN_ID,
+            &self.device,
+        )?;
+
+        // Phase 2: Batched autoregressive generation
+        // Process frame-by-frame, but run the transformer for all sequences
+        let mut all_codes: Vec<FrameCodes> = (0..n).map(|_| Vec::new()).collect();
+        let mut done: Vec<bool> = vec![false; n];
+        let mut penalty_masks: Vec<Tensor> = (0..n)
+            .map(|_| Tensor::zeros((1, codec_tokens::CODEC_VOCAB_SIZE), DType::F32, &self.device))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Sample initial tokens per sequence
+        let mut semantic_tokens: Vec<Tensor> = Vec::with_capacity(n);
+        let mut semantic_ids: Vec<u32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let logits_2d = all_logits[i].squeeze(1)?;
+            let logits_2d = self.apply_generation_penalties_gpu(
+                &logits_2d, &penalty_masks[i], &gen_config, 0, Some(&suppression_mask),
+            )?;
+            let tok = generation::sample(&logits_2d, &gen_config, &mut all_sampling[i])?;
+            let id: u32 = tok.flatten_all()?.to_vec1::<u32>()?[0];
+            Self::update_penalty_mask(&mut penalty_masks[i], id, codec_tokens::CODEC_VOCAB_SIZE)?;
+            semantic_tokens.push(tok);
+            semantic_ids.push(id);
+        }
+
+        let mut cp_kv_caches: Vec<Vec<models::transformer::AnyKVCache>> =
+            (0..n).map(|_| self.code_predictor.new_kv_caches()).collect();
+
+        for frame_idx in 0..gen_config.max_new_tokens {
+            let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
+            if active.is_empty() {
+                break;
+            }
+
+            // Check EOS for each sequence
+            for &i in &active {
+                if let Some(eos_id) = gen_config.eos_token_id {
+                    if semantic_ids[i] == eos_id {
+                        done[i] = true;
+                    }
+                }
+            }
+            let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
+            if active.is_empty() {
+                break;
+            }
+
+            // Per-sequence: code predictor + embedding sum (fast, ~15 steps each)
+            let mut step_inputs: Vec<Tensor> = Vec::with_capacity(active.len());
+            for &i in &active {
+                let semantic_embed = self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i])?;
+                let acoustic_codes = self.code_predictor.generate_acoustic_codes(
+                    &all_hidden[i], &semantic_embed, &mut cp_kv_caches[i],
+                )?;
+
+                // Build frame codes
+                let frame_codes_tensor = Tensor::cat(
+                    &[&semantic_tokens[i].reshape(1)?, &acoustic_codes], 0,
+                )?;
+                let frame_vec: Vec<u32> = frame_codes_tensor.to_vec1()?;
+                all_codes[i].push(frame_vec);
+
+                // Sum embeddings for next step
+                let acoustic_sum = self.code_predictor
+                    .get_acoustic_embeddings_sum_from_tensor(&acoustic_codes)?;
+                let summed = semantic_embed.add(&acoustic_sum)?;
+
+                let text_addition = if frame_idx < all_trailing_len[i] {
+                    all_trailing[i].i((.., frame_idx..frame_idx + 1, ..))?
+                } else {
+                    tts_pad_embed.clone()
+                };
+                step_inputs.push(summed.add(&text_addition)?);
+            }
+
+            // BATCHED FORWARD: stack all active sequences → single transformer pass
+            if active.len() > 1 {
+                let batched_input = Tensor::cat(
+                    &step_inputs.iter().collect::<Vec<_>>(), 0,
+                )?; // [active_n, 1, hidden]
+
+                // Run through transformer layers with per-sequence KV caches
+                // Since KV caches differ per sequence, we process in a single
+                // batched matmul but update caches individually
+                let mut batched_hidden = batched_input;
+                for (layer_idx, layer) in self.talker.layers_iter().enumerate() {
+                    // Stack KV caches for this layer
+                    let mut layer_ks: Vec<Tensor> = Vec::new();
+                    let mut layer_vs: Vec<Tensor> = Vec::new();
+                    for &i in &active {
+                        if let Some((k, v)) = all_kv[i][layer_idx].peek() {
+                            layer_ks.push(k.clone());
+                            layer_vs.push(v.clone());
+                        }
+                    }
+
+                    if !layer_ks.is_empty() {
+                        // Stack: [N, heads, seq, head_dim]
+                        let max_seq = layer_ks.iter().map(|k| k.dim(2).unwrap_or(0)).max().unwrap_or(0);
+
+                        // Pad KV caches to same seq length
+                        let mut padded_ks = Vec::new();
+                        let mut padded_vs = Vec::new();
+                        for (k, v) in layer_ks.iter().zip(layer_vs.iter()) {
+                            let seq = k.dim(2)?;
+                            if seq < max_seq {
+                                let pad_len = max_seq - seq;
+                                let k_pad = Tensor::zeros(
+                                    &[k.dim(0)?, k.dim(1)?, pad_len, k.dim(3)?],
+                                    k.dtype(), &self.device,
+                                )?;
+                                let v_pad = Tensor::zeros(
+                                    &[v.dim(0)?, v.dim(1)?, pad_len, v.dim(3)?],
+                                    v.dtype(), &self.device,
+                                )?;
+                                padded_ks.push(Tensor::cat(&[&k_pad, k], 2)?);
+                                padded_vs.push(Tensor::cat(&[&v_pad, v], 2)?);
+                            } else {
+                                padded_ks.push(k.clone());
+                                padded_vs.push(v.clone());
+                            }
+                        }
+
+                        let stacked_k = Tensor::cat(&padded_ks, 0)?;
+                        let stacked_v = Tensor::cat(&padded_vs, 0)?;
+
+                        // Create a temporary batched KV cache
+                        let mut batch_cache = models::kv_cache::KVCache::new();
+                        batch_cache.set_kv(stacked_k, stacked_v);
+                        let mut any_cache = models::transformer::AnyKVCache::Concat(batch_cache);
+
+                        batched_hidden = layer.forward(
+                            &batched_hidden,
+                            self.talker.rope(),
+                            None, // no mask for seq_len=1
+                            Some(&mut any_cache),
+                            max_seq, // offset = max_seq (all attend to full cache)
+                        )?;
+
+                        // Extract updated KV and split back per sequence
+                        if let Some((new_k, new_v)) = any_cache.peek() {
+                            for (idx, &i) in active.iter().enumerate() {
+                                let k_i = new_k.i(idx..idx + 1)?;
+                                let v_i = new_v.i(idx..idx + 1)?;
+                                // Trim padding from the left
+                                let orig_seq = all_kv[i][layer_idx]
+                                    .peek()
+                                    .map(|(k, _)| k.dim(2).unwrap_or(0))
+                                    .unwrap_or(0);
+                                let new_seq = k_i.dim(2)?;
+                                let start = new_seq - orig_seq - 1;
+                                // Actually, just store the full new cache
+                                // (simpler, slightly more memory)
+                                all_kv[i][layer_idx].replace_kv(
+                                    k_i.i((.., .., max_seq - orig_seq..))?,
+                                    v_i.i((.., .., max_seq - orig_seq..))?,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Apply norm and codec head
+                batched_hidden = self.talker.apply_norm(&batched_hidden)?;
+                let batched_logits = self.talker.apply_codec_head(&batched_hidden)?;
+
+                // Split results per sequence and sample
+                for (idx, &i) in active.iter().enumerate() {
+                    all_hidden[i] = batched_hidden.i(idx..idx + 1)?;
+                    let logits_i = batched_logits.i(idx..idx + 1)?.squeeze(1)?;
+                    let logits_i = self.apply_generation_penalties_gpu(
+                        &logits_i, &penalty_masks[i], &gen_config,
+                        frame_idx + 1, Some(&suppression_mask),
+                    )?;
+                    semantic_tokens[i] = generation::sample(&logits_i, &gen_config, &mut all_sampling[i])?;
+                    semantic_ids[i] = semantic_tokens[i].flatten_all()?.to_vec1::<u32>()?[0];
+                    Self::update_penalty_mask(
+                        &mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE,
+                    )?;
+                    all_offsets[i] += 1;
+                }
+            } else {
+                // Single active sequence — use original path
+                let i = active[0];
+                let (h, logits) = self.talker.generate_step_with_embed(
+                    &step_inputs[0], &mut all_kv[i], all_offsets[i],
+                )?;
+                all_offsets[i] += 1;
+                all_hidden[i] = h;
+                let logits_2d = logits.squeeze(1)?;
+                let logits_2d = self.apply_generation_penalties_gpu(
+                    &logits_2d, &penalty_masks[i], &gen_config,
+                    frame_idx + 1, Some(&suppression_mask),
+                )?;
+                semantic_tokens[i] = generation::sample(&logits_2d, &gen_config, &mut all_sampling[i])?;
+                semantic_ids[i] = semantic_tokens[i].flatten_all()?.to_vec1::<u32>()?[0];
+                Self::update_penalty_mask(
+                    &mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE,
+                )?;
+            }
+        }
+
+        // Phase 3: Decode each sequence
+        let mut results = Vec::with_capacity(n);
+        for codes in &all_codes {
+            let audio = self.decode_codes(codes)?;
+            results.push(audio);
+        }
+        Ok(results)
+    }
+
     /// Create a streaming synthesis session with a specific voice and language.
     ///
     /// Returns an iterator that yields audio chunks as they are generated.

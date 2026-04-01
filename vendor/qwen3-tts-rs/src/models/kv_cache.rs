@@ -88,6 +88,20 @@ impl KVCache {
         self.k = None;
         self.v = None;
     }
+
+    /// Set KV cache directly (for batched inference).
+    pub fn set_kv(&mut self, k: Tensor, v: Tensor) {
+        self.k = Some(k);
+        self.v = Some(v);
+    }
+
+    /// Peek at current KV tensors without consuming.
+    pub fn peek(&self) -> Option<(&Tensor, &Tensor)> {
+        match (&self.k, &self.v) {
+            (Some(k), Some(v)) => Some((k, v)),
+            _ => None,
+        }
+    }
 }
 
 // ─── Unified cache enum ─────────────────────────────────────────────────────
@@ -115,6 +129,27 @@ impl AnyKVCache {
         match self {
             AnyKVCache::Concat(cache) => cache.reset(),
             AnyKVCache::PreAlloc(cache) => cache.reset(),
+        }
+    }
+
+    /// Peek at current KV tensors.
+    pub fn peek(&self) -> Option<(&Tensor, &Tensor)> {
+        match self {
+            AnyKVCache::Concat(cache) => cache.peek(),
+            AnyKVCache::PreAlloc(_) => None, // PreAlloc doesn't support peek
+        }
+    }
+
+    /// Replace KV cache contents (for batched inference).
+    pub fn replace_kv(&mut self, k: Tensor, v: Tensor) {
+        match self {
+            AnyKVCache::Concat(cache) => cache.set_kv(k, v),
+            AnyKVCache::PreAlloc(_) => {
+                // Replace with concat cache
+                let mut new_cache = KVCache::new();
+                new_cache.set_kv(k, v);
+                *self = AnyKVCache::Concat(new_cache);
+            }
         }
     }
 }
