@@ -1218,13 +1218,10 @@ impl Qwen3TTS {
             // BATCHED code predictor: all active sequences in one pass
             let active: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
 
-            // Batched semantic embedding: stack tokens → single embedding lookup
-            let active_tokens: Vec<&Tensor> = active.iter().map(|&i| &semantic_tokens[i]).collect();
-            let stacked_tokens = Tensor::stack(&active_tokens, 0)?; // [A]
-            let active_semantic_embeds_batched = self.talker.get_codec_embedding_batch(&stacked_tokens)?; // [A, 1, hidden]
-            let active_semantic_embeds: Vec<Tensor> = (0..active.len())
-                .map(|j| active_semantic_embeds_batched.i(j..j+1))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            // Semantic embedding lookup per active sequence
+            let active_semantic_embeds: Vec<Tensor> = active.iter()
+                .map(|&i| self.talker.get_codec_embedding_from_tensor(&semantic_tokens[i]))
+                .collect::<Result<Vec<_>>>()?;
             let active_hiddens: Vec<Tensor> = active.iter()
                 .map(|&i| last_hiddens[i].clone())
                 .collect();
@@ -1327,17 +1324,15 @@ impl Qwen3TTS {
             }
         }
 
-        // Phase 4: Parallel decode each sequence (CPU-bound, use rayon)
-        use rayon::prelude::*;
-        let results: Vec<AudioBuffer> = all_codes.par_iter()
-            .map(|codes| {
-                if codes.is_empty() {
-                    AudioBuffer::new(vec![], 24000)
-                } else {
-                    self.decode_codes(codes).unwrap_or_else(|_| AudioBuffer::new(vec![], 24000))
-                }
-            })
-            .collect();
+        // Phase 4: Decode each sequence
+        let mut results = Vec::with_capacity(n);
+        for codes in &all_codes {
+            if codes.is_empty() {
+                results.push(AudioBuffer::new(vec![], 24000));
+            } else {
+                results.push(self.decode_codes(codes)?);
+            }
+        }
         Ok(results)
     }
 
