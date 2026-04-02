@@ -973,7 +973,7 @@ impl Qwen3TTS {
             // so only the remaining tokens go to trailing_text.
             let (icl_embed, icl_trailing) =
                 self.talker
-                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, true)?;
+                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, false)?;
 
             let icl_len = icl_embed.dim(1)?;
             if icl_len > 0 {
@@ -1032,21 +1032,28 @@ impl Qwen3TTS {
         let _decode_span = tracing::info_span!("decode").entered();
 
         let audio = if let Some(ref_codes) = &prompt.ref_codes {
-            // ICL mode: the model generates ref_text audio as warm-up, then target text.
-            // Skip the warm-up frames. The number of warm-up frames ≈ ref_codes length
-            // (the model reproduces the reference audio before generating new content).
-            let ref_frame_count = ref_codes.dim(0).unwrap_or(0);
+            // Match official Python implementation exactly:
+            // 1. Prepend ref_codes to generated codes
+            // 2. Decode everything together (vocoder needs full context)
+            // 3. Cut proportionally: cut = ref_len / total_len * wav_samples
+            let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
+            let ref_len = ref_frames.len();
+
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
-            } else if ref_frame_count > 0 && all_codes.len() > ref_frame_count {
-                let gen_only = &all_codes[ref_frame_count..];
-                tracing::debug!(
-                    "ICL: total_frames={}, ref_frames={}, gen_frames={}",
-                    all_codes.len(), ref_frame_count, gen_only.len()
-                );
-                self.decode_codes(gen_only)?
             } else {
-                self.decode_codes(&all_codes)?
+                let mut combined = ref_frames;
+                combined.extend(all_codes.iter().cloned());
+                let total_len = combined.len();
+
+                let mut audio = self.decode_codes(&combined)?;
+                let cut = ref_len * audio.len() / total_len.max(1);
+                tracing::debug!(
+                    "ICL decode: ref_frames={}, gen_frames={}, total_samples={}, cut_samples={}",
+                    ref_len, all_codes.len(), audio.len(), cut
+                );
+                audio.samples = audio.samples[cut..].to_vec();
+                audio
             }
         } else {
             self.decode_codes(&all_codes)?
