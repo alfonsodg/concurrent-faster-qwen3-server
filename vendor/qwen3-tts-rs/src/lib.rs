@@ -967,7 +967,7 @@ impl Qwen3TTS {
             // so only the remaining tokens go to trailing_text.
             let (icl_embed, icl_trailing) =
                 self.talker
-                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, false)?;
+                    .build_icl_prompt(&input_ids, ref_text_ids, &ref_codec_embeds, true)?;
 
             let icl_len = icl_embed.dim(1)?;
             if icl_len > 0 {
