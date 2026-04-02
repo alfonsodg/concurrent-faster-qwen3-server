@@ -117,6 +117,7 @@ Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces K
 | `698e705` | Production-readiness fixes (#10) | Queue depth, streaming temperature, voice clone errors, temp cleanup |
 | `dffa961` | Hardening (#11-#14) | Cargo profiles, mutex recovery, temp-file write check, explicit clone errors |
 | `19bc541` | Server unit tests (#15) | 10 tests covering API paths, Drop cleanup, metrics |
+| `f678165` | Fix ICL voice cloning shape mismatch (#16) | `get_codec_embedding_batch` unsqueeze(0) vs unsqueeze(1) |
 
 ### Failed experiments
 

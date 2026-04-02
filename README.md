@@ -21,7 +21,7 @@ From [GitLab Releases](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-serve
 ```bash
 curl --header "PRIVATE-TOKEN: <your-token>" \
   -o qwen3-tts-server \
-  "https://scovil.labtau.com/api/v4/projects/622/packages/generic/qwen3-tts-server/0.3.0/qwen3-tts-server-v0.3.0-linux-x86_64"
+  "https://scovil.labtau.com/api/v4/projects/622/packages/generic/qwen3-tts-server/0.3.2/qwen3-tts-server-v0.3.2-linux-x86_64"
 chmod +x qwen3-tts-server
 ```
 
