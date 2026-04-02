@@ -201,10 +201,45 @@ The binary is statically linked with CUDA runtime. No container needed — just 
 
 ## Build from Source
 
-Requires Modal account for H100 cross-compilation:
+### Local compilation
+
+Requires Rust, CUDA toolkit 12.x, CMake, clang, and pkg-config:
 
 ```bash
-modal run modal_compile.py          # compile on H100 (targets L4 sm_89)
+# Install dependencies (Ubuntu/Debian)
+sudo apt install cmake pkg-config libssl-dev libasound2-dev libclang-dev clang
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Clone and build
+git clone git@scovil.labtau.com:ccvass/ai-audio/qwen3-tts-server.git
+cd qwen3-tts-server
+cargo build --release --features cuda,flash-attn
+
+# Binary at target/release/qwen3-tts-server
+```
+
+For flash-attn, the CUDA compute capability must match your GPU. Set `CUDA_COMPUTE_CAP` if needed:
+
+```bash
+CUDA_COMPUTE_CAP=89 cargo build --release --features cuda,flash-attn  # L4, L40S
+CUDA_COMPUTE_CAP=80 cargo build --release --features cuda,flash-attn  # A100
+CUDA_COMPUTE_CAP=90 cargo build --release --features cuda,flash-attn  # H100
+```
+
+Without flash-attn (simpler, slightly slower):
+
+```bash
+cargo build --release --features cuda
+```
+
+### Cross-compilation on Modal
+
+For building on H100 targeting L4 (sm_89):
+
+```bash
+modal run modal_compile.py          # compile on H100
 ```
 
 ## Benchmarking
