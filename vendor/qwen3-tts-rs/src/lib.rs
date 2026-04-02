@@ -1389,13 +1389,40 @@ impl Qwen3TTS {
             }
         }
 
-        // Phase 4: Decode each sequence
-        let mut results = Vec::with_capacity(n);
-        for codes in &all_codes {
-            if codes.is_empty() {
-                results.push(AudioBuffer::new(vec![], 24000));
-            } else {
-                results.push(self.decode_codes(codes)?);
+        // Phase 4: Batched vocoder decode
+        let non_empty: Vec<(usize, &Vec<Vec<u32>>)> = all_codes.iter().enumerate()
+            .filter(|(_, c)| !c.is_empty()).collect();
+
+        let mut results: Vec<AudioBuffer> = (0..n).map(|_| AudioBuffer::new(vec![], 24000)).collect();
+
+        if non_empty.len() > 1 {
+            // Batch decode: pad to max frames, stack [N, 16, T_max], single vocoder pass
+            let max_frames = non_empty.iter().map(|(_, c)| c.len()).max().unwrap_or(0);
+            let frame_lens: Vec<usize> = non_empty.iter().map(|(_, c)| c.len()).collect();
+
+            let mut batch_data = vec![0i64; non_empty.len() * 16 * max_frames];
+            for (batch_idx, (_, codes)) in non_empty.iter().enumerate() {
+                for (frame, frame_codes) in codes.iter().enumerate() {
+                    for (q, &code) in frame_codes.iter().enumerate() {
+                        batch_data[batch_idx * 16 * max_frames + q * max_frames + frame] = code as i64;
+                    }
+                }
+            }
+            let batched_tensor = Tensor::from_vec(
+                batch_data, (non_empty.len(), 16, max_frames), &self.device,
+            )?;
+            let waveform = self.decoder.decode(&batched_tensor)?; // [N, 1, total_samples]
+            let samples_per_frame = 24000 / 12; // 2000 samples per frame at 24kHz/12Hz
+            for (batch_idx, (orig_idx, _)) in non_empty.iter().enumerate() {
+                let actual_samples = frame_lens[batch_idx] * samples_per_frame;
+                let wav_i = waveform.i(batch_idx)?.flatten_all()?;
+                let trim_len = actual_samples.min(wav_i.dim(0)?);
+                let trimmed = wav_i.narrow(0, 0, trim_len)?;
+                results[*orig_idx] = AudioBuffer::from_tensor(trimmed, 24000)?;
+            }
+        } else {
+            for (orig_idx, codes) in &non_empty {
+                results[*orig_idx] = self.decode_codes(codes)?;
             }
         }
         Ok(results)
