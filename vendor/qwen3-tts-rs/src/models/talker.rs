@@ -985,7 +985,7 @@ impl TalkerModel {
     /// Tensor of shape `[1, T, hidden_size]`
     pub fn get_codec_embedding_batch(&self, token_ids: &Tensor) -> Result<Tensor> {
         let embed = self.codec_embedding.forward(token_ids)?; // [N, hidden_size]
-        Ok(embed.unsqueeze(1)?) // [N, 1, hidden_size]
+        Ok(embed.unsqueeze(0)?) // [1, N, hidden_size]
     }
 }
 
