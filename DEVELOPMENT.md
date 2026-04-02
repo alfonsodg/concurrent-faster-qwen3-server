@@ -61,13 +61,13 @@ Build: flash-attn enabled, `CUDA_COMPUTE_CAP=89`, compiled on H100.
 
 | Batch | Audio total | Wall time | Throughput (RTx) | Latency/req |
 |-------|------------|-----------|------------------|-------------|
-| 1 | 5.0s | 2.6s | 1.94x | 2.6s |
-| 2 | 9.8s | 2.9s | 3.42x | 1.4s |
-| 4 | 19.2s | 3.2s | 5.99x | 0.8s |
-| 8 | 40.6s | 4.2s | 9.70x | 0.5s |
-| 16 | 81.4s | 6.1s | 13.43x | 0.4s |
+| 1 | 5.0s | 2.4s | 2.12x | 2.4s |
+| 2 | 9.8s | 2.5s | 3.84x | 1.3s |
+| 4 | 19.5s | 2.8s | 6.99x | 0.7s |
+| 8 | 41.4s | 3.6s | 11.49x | 0.4s |
+| 16 | 84.6s | 5.1s | 16.59x | 0.3s |
 
-Streaming TTFA (Time To First Audio): ~482ms (single sequence).
+Streaming TTFA (Time To First Audio): ~450ms (single sequence).
 
 Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces KV cache pre-allocation by ~75%.
 
@@ -91,8 +91,8 @@ Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces K
 
 | Metric | vLLM-Omni | qwen3-tts-server |
 |--------|-----------|------------------|
-| Single RTx (denise voice) | 1.9x | 1.94x |
-| Batch throughput | ~5.5x at 8 CCU (estimated) | 13.43x at batch=16 |
+| Single RTx (denise voice) | 1.9x | 2.12x |
+| Batch throughput | ~5.5x at 8 CCU (estimated) | 16.59x at batch=16 |
 | VRAM idle | ~8GB+ | 2.7GB |
 | Voice cloning | Yes (via API) | Yes (ref_audio base64, batched) |
 | Streaming | WebSocket | HTTP chunked transfer |
@@ -114,6 +114,7 @@ Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces K
 | `1c3fc94` | Batched code predictor in streaming path | TTFA 761ms → 490ms, streaming now uses `generate_acoustic_codes_batched()` |
 | `059ac10` | Adaptive max_length + OOM batch splitting | Batch=16 on L4: 13.43x RT (0.4s/req), KV cache 2048→122 for call center text |
 | `23ba457` | /metrics endpoint + streaming format header | Prometheus-compatible metrics, atomic counters, x-audio-format header |
+| `4838106` | Batched vocoder decoding | Batch=16: 13.43x → 16.59x RT (+24%), TTFA 482ms → 450ms |
 
 ### Failed experiments
 
@@ -179,7 +180,7 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 | Issue | Title | Expected Impact |
 |-------|-------|-----------------|
 | [#1](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/1) | Speculative decoding for single-stream | Batch=1: 2.6s → ~1.5-1.8s (35-40% reduction) |
-| [#2](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/2) | Batched vocoder decoding (Phase 4) | Batch=16: ~200-400ms saved |
+| [#2](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/2) | ~~Batched vocoder decoding (Phase 4)~~ ✅ `4838106` | Batch=16: 13.43x → 16.59x RT (+24%) |
 
 ### Medium Priority
 
