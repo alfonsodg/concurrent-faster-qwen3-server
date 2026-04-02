@@ -343,3 +343,131 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_parse_language() {
+        assert!(matches!(parse_language("spanish"), Language::Spanish));
+        assert!(matches!(parse_language("es"), Language::Spanish));
+        assert!(matches!(parse_language("english"), Language::English));
+        assert!(matches!(parse_language("en"), Language::English));
+        assert!(matches!(parse_language("french"), Language::French));
+        assert!(matches!(parse_language("unknown"), Language::Spanish)); // default
+    }
+
+    #[test]
+    fn test_wav_header_structure() {
+        let h = wav_header(24000, 1000);
+        assert_eq!(h.len(), 44);
+        assert_eq!(&h[0..4], b"RIFF");
+        assert_eq!(&h[8..12], b"WAVE");
+        assert_eq!(&h[12..16], b"fmt ");
+        assert_eq!(&h[36..40], b"data");
+    }
+
+    #[test]
+    fn test_samples_to_pcm16() {
+        let samples = vec![0.0f32, 1.0, -1.0, 0.5];
+        let pcm = samples_to_pcm16(&samples);
+        assert_eq!(pcm.len(), 8); // 4 samples * 2 bytes
+        // 0.0 -> 0
+        assert_eq!(i16::from_le_bytes([pcm[0], pcm[1]]), 0);
+        // 1.0 -> 32767
+        assert_eq!(i16::from_le_bytes([pcm[2], pcm[3]]), 32767);
+        // -1.0 -> -32767
+        assert_eq!(i16::from_le_bytes([pcm[4], pcm[5]]), -32767);
+    }
+
+    #[test]
+    fn test_audio_to_wav_bytes() {
+        let samples = vec![0.0f32; 100];
+        let wav = audio_to_wav_bytes(&samples, 24000).unwrap();
+        assert!(wav.len() > 44); // header + data
+        assert_eq!(&wav[0..4], b"RIFF");
+    }
+
+    #[test]
+    fn test_decode_ref_audio_valid_base64() {
+        // Minimal WAV: just some bytes encoded as base64
+        let bytes = vec![0u8; 44]; // fake WAV header
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let req = SpeechRequest {
+            text: "test".into(),
+            language: "spanish".into(),
+            ref_audio: Some(b64),
+            ref_text: Some("ref".into()),
+            temperature: None,
+            stream: None,
+        };
+        let result = decode_ref_audio(&req);
+        assert!(result.is_some());
+        let vc = result.unwrap();
+        assert!(vc.ref_audio_path.exists());
+        assert_eq!(vc.ref_text, Some("ref".into()));
+        // Drop should clean up
+        let path = vc.ref_audio_path.clone();
+        drop(vc);
+        // VoiceCloneData is in batch module, Drop cleans up
+    }
+
+    #[test]
+    fn test_decode_ref_audio_invalid_base64() {
+        let req = SpeechRequest {
+            text: "test".into(),
+            language: "spanish".into(),
+            ref_audio: Some("not-valid-base64!!!".into()),
+            ref_text: None,
+            temperature: None,
+            stream: None,
+        };
+        assert!(decode_ref_audio(&req).is_none());
+    }
+
+    #[test]
+    fn test_decode_ref_audio_none() {
+        let req = SpeechRequest {
+            text: "test".into(),
+            language: "spanish".into(),
+            ref_audio: None,
+            ref_text: None,
+            temperature: None,
+            stream: None,
+        };
+        assert!(decode_ref_audio(&req).is_none());
+    }
+
+    #[test]
+    fn test_voice_clone_data_drop_cleanup() {
+        let tmp = std::env::temp_dir().join("test_vc_drop.wav");
+        std::fs::write(&tmp, b"test").unwrap();
+        assert!(tmp.exists());
+        let vc = batch::VoiceCloneData {
+            ref_audio_path: tmp.clone(),
+            ref_text: None,
+        };
+        drop(vc);
+        assert!(!tmp.exists(), "Drop should have deleted temp file");
+    }
+
+    #[test]
+    fn test_voice_clone_data_drop_missing_file() {
+        // Should not panic if file doesn't exist
+        let vc = batch::VoiceCloneData {
+            ref_audio_path: "/tmp/nonexistent_vc_test.wav".into(),
+            ref_text: None,
+        };
+        drop(vc); // should not panic
+    }
+
+    #[test]
+    fn test_metrics_struct() {
+        let m = Metrics::new();
+        assert_eq!(m.requests_total.load(std::sync::atomic::Ordering::Relaxed), 0);
+        m.requests_total.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(m.requests_total.load(std::sync::atomic::Ordering::Relaxed), 5);
+    }
+}
