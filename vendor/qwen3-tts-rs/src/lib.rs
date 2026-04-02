@@ -941,7 +941,13 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _prefill_span = tracing::info_span!("prefill").entered();
 
-        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256);
+        // ICL prompt can be very large (ref_text + target_text + ref_codec_frames)
+        let icl_extra = if is_icl {
+            let ref_frames = prompt.ref_codes.as_ref().map(|c| c.dim(0).unwrap_or(0)).unwrap_or(0);
+            let ref_text_len = prompt.ref_text_ids.as_ref().map(|t| t.len()).unwrap_or(0);
+            ref_frames + ref_text_len + input_ids.len() + 16
+        } else { 0 };
+        let mut kv_caches = self.talker.new_kv_caches(gen_config.max_new_tokens + 256 + icl_extra);
         let (hidden, logits) = self.talker.prefill_voice_clone(
             &input_ids,
             &speaker_embed,
