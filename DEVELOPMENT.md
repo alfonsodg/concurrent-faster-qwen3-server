@@ -67,7 +67,7 @@ Build: flash-attn enabled, `CUDA_COMPUTE_CAP=89`, compiled on H100.
 | 8 | 40.6s | 4.1s | 9.98x | 0.5s |
 | 16 | OOM | — | — | — |
 
-Streaming TTFA (Time To First Audio): ~761ms (single sequence).
+Streaming TTFA (Time To First Audio): ~490ms (single sequence).
 
 ### Upstream `qwen3-tts-rs` baseline (same L4)
 
@@ -109,6 +109,7 @@ Streaming TTFA (Time To First Audio): ~761ms (single sequence).
 | `49ccef4` | Pre-allocate zero tensor | Minor allocation reduction |
 | `18ce1e9` | Voice cloning in batch mode + busy-wait fix (10ms) | Batch=8: 9.56x → 9.98x RT, voice clone no longer falls back to sequential |
 | `31acfab` | Batched streaming worker (up to 8 concurrent streams) | Streaming uses `synthesize_batch_streaming`, decodes every 10 frames |
+| `1c3fc94` | Batched code predictor in streaming path | TTFA 761ms → 490ms, streaming now uses `generate_acoustic_codes_batched()` |
 
 ### Failed experiments
 
