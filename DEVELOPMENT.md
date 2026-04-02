@@ -186,7 +186,18 @@ Binary size: ~233 MB (statically linked CUDA + flash-attn + ort).
 
 | Issue | Title | Expected Impact |
 |-------|-------|-----------------|
-| [#3](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/3) | Batched prefill embedding (Phase 1) | Batch=16: ~100-200ms saved |
+| [#3](https://scovil.labtau.com/ccvass/ai-audio/qwen3-tts-server/-/issues/3) | ~~Batched prefill embedding (Phase 1)~~ ✅ `0ead9c5` | Code cleanup, shared tensors pre-computed |
+
+### Profiling Breakdown (single-stream, L4)
+
+```
+Prefill:      12ms   (0.5%)
+Generation: 2,385ms  (92.5%) — 65 frames, 36.7ms/frame
+Decode:      184ms   (7.1%)
+Total:     2,580ms
+```
+
+Generation loop (transformer + code predictor) is 92.5% of wall time. Further optimization requires profiling the per-frame breakdown (transformer forward vs code predictor's 15 sequential acoustic steps).
 
 ## Pending Work — Features
 
