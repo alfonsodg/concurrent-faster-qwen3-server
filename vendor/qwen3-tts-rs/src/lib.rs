@@ -1031,12 +1031,20 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _decode_span = tracing::info_span!("decode").entered();
 
-        let audio = if let Some(_ref_codes) = &prompt.ref_codes {
-            // ICL mode: the transformer was already conditioned on ref audio/text
-            // during the ICL prefill. Only decode the generated frames — do NOT
-            // prepend ref_codes to the vocoder input.
+        let audio = if let Some(ref_codes) = &prompt.ref_codes {
+            // ICL mode: the model generates ref_text audio as warm-up, then target text.
+            // Skip the warm-up frames. The number of warm-up frames ≈ ref_codes length
+            // (the model reproduces the reference audio before generating new content).
+            let ref_frame_count = ref_codes.dim(0).unwrap_or(0);
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
+            } else if ref_frame_count > 0 && all_codes.len() > ref_frame_count {
+                let gen_only = &all_codes[ref_frame_count..];
+                tracing::debug!(
+                    "ICL: total_frames={}, ref_frames={}, gen_frames={}",
+                    all_codes.len(), ref_frame_count, gen_only.len()
+                );
+                self.decode_codes(gen_only)?
             } else {
                 self.decode_codes(&all_codes)?
             }
