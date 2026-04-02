@@ -1031,38 +1031,18 @@ impl Qwen3TTS {
         #[cfg(feature = "profiling")]
         let _decode_span = tracing::info_span!("decode").entered();
 
-        let audio = if let (Some(ref_codes), Some(ref_text_ids)) = (&prompt.ref_codes, &prompt.ref_text_ids) {
-            // ICL mode: model generates frames for ref_text + target_text.
-            // The generated all_codes contains warm-up frames (ref_text audio)
-            // followed by target text audio. We need to:
-            // 1. Prepend original ref_codes for vocoder context
-            // 2. Decode together
-            // 3. Cut: ref_codes portion + warm-up portion from generated frames
+        let audio = if let Some(ref_codes) = &prompt.ref_codes {
             let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
-            let ref_encoder_len = ref_frames.len(); // original ref audio frames
-            let ref_text_len = ref_text_ids.len();
-            let total_text_len = ref_text_len + input_ids.len() + 1; // ref + target + eos
-
+            let ref_len = ref_frames.len();
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
             } else {
-                // Warm-up frames in all_codes ≈ ref_text proportion of total text
-                let warmup_gen_frames = all_codes.len() * ref_text_len / total_text_len.max(1);
-
                 let mut combined = ref_frames;
                 combined.extend(all_codes.iter().cloned());
-                let total_combined = combined.len();
-
-                // Total frames to cut = ref_encoder frames + warm-up generated frames
-                let frames_to_cut = ref_encoder_len + warmup_gen_frames;
-
+                let total_len = combined.len();
                 let mut audio = self.decode_codes(&combined)?;
-                let cut = frames_to_cut * audio.len() / total_combined.max(1);
-                tracing::info!(
-                    "ICL decode: ref_enc={}, warmup_gen={}, gen_total={}, cut_frames={}, total_samples={}, cut_samples={}",
-                    ref_encoder_len, warmup_gen_frames, all_codes.len(), frames_to_cut, audio.len(), cut
-                );
-                audio.samples = audio.samples[cut.min(audio.len())..].to_vec();
+                let cut = ref_len * audio.len() / total_len.max(1);
+                audio.samples = audio.samples[cut..].to_vec();
                 audio
             }
         } else {
