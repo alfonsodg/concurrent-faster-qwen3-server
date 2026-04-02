@@ -4,16 +4,17 @@ Comparative evaluation of TTS models tested on NVIDIA L4 (24GB) and L40S (48GB) 
 
 ## Summary
 
-| Model | Params | GPU | Batching | Best Throughput | Voice Clone | License |
-|-------|--------|-----|----------|----------------|-------------|---------|
-| **qwen3-tts-server** (ours) | 600M | L4 | ✅ Batch=16 | **16.59x RT** | ✅ ICL + x_vector | MIT |
-| **OmniVoice 0.6B** | 600M | L4 | ❌ Sequential | **6.8x RT** (seq) | ✅ Zero-shot | Apache 2.0 |
-| **Multilingual-Exp 0.6B** | 600M | L4 | ✅ vLLM | **14.1x RT** @8 CCU | ✅ (poor accent) | Open |
-| **Higgs Audio V2 3B** | 3B | L40S | ✅ vLLM | **8.0x RT** @8 CCU | ✅ Good | Apache 2.0 |
-| **Voxtral 4B** | 4B | L40S | ✅ vLLM-Omni | **13.5x RT** @8 CCU | ❌ | CC-BY-NC |
-| **Kokoro 82M** | 82M | L4 | ❌ Single | **15x RT** | ✅ (via RVC) | Apache 2.0 |
-| **Supertonic 2 66M** | 66M | CPU | ONNX threads | **68x RT** | ❌ (10 fixed) | OpenRAIL |
-| **qts (GGUF)** | 600M | L4 | ❌ Single | **0.23x RT** (Q8) | ✅ | Apache 2.0 |
+| Model | Params | GPU | Batching | Best Throughput | Voice Clone | VRAM Idle | VRAM Peak | License |
+|-------|--------|-----|----------|----------------|-------------|-----------|-----------|---------|
+| **qwen3-tts-server** (ours) | 600M | L4 | ✅ Batch=16 | **16.59x RT** | ✅ ICL + x_vector | 2.7GB | ~5GB | MIT |
+| **OmniVoice 0.6B** | 600M | L4 | ❌ Sequential | **6.8x RT** (seq) | ✅ Zero-shot | 1.9GB | 2.3GB | Apache 2.0 |
+| **Multilingual-Exp 0.6B** | 600M | L4 | ✅ vLLM | **14.1x RT** @8 CCU | ✅ (poor accent) | 12.2GB | ~14GB | Open |
+| **Higgs Audio V2 3B** | 3B | L40S | ✅ vLLM | **8.0x RT** @8 CCU | ✅ Good | 38.2GB | ~42GB | Apache 2.0 |
+| **Voxtral 4B** | 4B | L40S | ✅ vLLM-Omni | **13.5x RT** @8 CCU | ❌ | 19.6GB (L4) | 36.9GB (L40S) | CC-BY-NC |
+| **Kokoro 82M** | 82M | L4 | ❌ Single | **15x RT** | ✅ (via RVC) | ~0.3GB | ~3GB | Apache 2.0 |
+| **Supertonic 2 66M** | 66M | CPU | ONNX threads | **68x RT** | ❌ (10 fixed) | 0 (CPU) | <1GB RAM | OpenRAIL |
+| **MOSS-TTS 1.7B** | 1.7B | L4 | ❌ Single | **0.3x RT** | ✅ Good | 13.4GB | ~15GB | Apache 2.0 |
+| **qts (GGUF)** | 600M | L4 | ❌ Single | **0.23x RT** (Q8) | ✅ | ~1.3GB | ~2GB | Apache 2.0 |
 
 ## Detailed Results
 
