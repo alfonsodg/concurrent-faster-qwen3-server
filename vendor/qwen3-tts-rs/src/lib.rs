@@ -1043,7 +1043,7 @@ impl Qwen3TTS {
                 // Warm-up frames = fixed count based on ref_text length (not proportional to output)
                 // ~0.5 frames per ref_text token, minus 1 frame margin for onset preservation
                 let ref_text_len = ref_text_ids.len();
-                let warmup_frames = (ref_text_len / 2).saturating_sub(1);
+                let warmup_frames = (ref_text_len * 2 / 3).saturating_sub(1);
                 let target_codes = if warmup_frames > 0 && warmup_frames < all_codes.len() {
                     &all_codes[warmup_frames..]
                 } else {
