@@ -1040,10 +1040,9 @@ impl Qwen3TTS {
             } else {
                 // Model generates frames for ref_text + target_text.
                 // Skip warm-up frames (ref_text portion) from generated codes.
-                let ref_text_len = ref_text_ids.len();
-                let target_text_len = input_ids.len();
-                let total_text = ref_text_len + target_text_len + 1;
-                let warmup_frames = (all_codes.len() * ref_text_len / total_text.max(1)).saturating_sub(1);
+                // Warm-up frames = fixed count based on ref_text length (not proportional to output)
+                // ~0.5 frames per ref_text token, minus 1 frame margin for onset preservation
+                let warmup_frames = (ref_text_len / 2).saturating_sub(1);
                 let target_codes = if warmup_frames > 0 && warmup_frames < all_codes.len() {
                     &all_codes[warmup_frames..]
                 } else {
