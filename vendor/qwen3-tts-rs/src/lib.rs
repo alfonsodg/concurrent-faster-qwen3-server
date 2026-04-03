@@ -1044,11 +1044,23 @@ impl Qwen3TTS {
                 let total_len = combined.len();
                 let mut audio = self.decode_codes(&combined)?;
                 let cut = ref_len * audio.len() / total_len.max(1);
-                tracing::info!(
-                    "ICL: ref={}fr gen={}fr total={}fr samples={} cut={}",
-                    ref_len, gen_len, total_len, audio.len(), cut
-                );
                 audio.samples = audio.samples[cut..].to_vec();
+
+                // ICL generates ~1.7x more frames than needed. Speed up to match
+                // expected duration: ~2 frames per text token at 12Hz.
+                let expected_frames = (input_ids.len() * 2).max(8);
+                let expected_samples = expected_frames * (24000 / 12);
+                if audio.len() > expected_samples * 13 / 10 { // >30% over expected
+                    let speed = audio.len() as f64 / expected_samples as f64;
+                    let new_len = (audio.len() as f64 / speed) as usize;
+                    let mut resampled = Vec::with_capacity(new_len);
+                    for i in 0..new_len {
+                        let src = (i as f64 * speed) as usize;
+                        resampled.push(audio.samples[src.min(audio.len() - 1)]);
+                    }
+                    tracing::info!("ICL speed: {:.2}x, {}→{} samples", speed, audio.len(), new_len);
+                    audio.samples = resampled;
+                }
                 audio
             }
         } else {
