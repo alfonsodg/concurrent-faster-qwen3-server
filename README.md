@@ -26,7 +26,7 @@ Streaming TTFA: 450ms. In a real call center scenario (~10% TTS duty cycle), a s
 | Kokoro 82M | ❌ Single | 15x RT | ✅ (via RVC) | 0.3GB |
 | Higgs Audio V2 3B | ✅ vLLM | 8.0x RT @8 CCU | ✅ | 38GB (L40S only) |
 
-Full comparison: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALUATION.md)
+Full comparison: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALUATION.md) | Complete evaluation of 29+ TTS and STT models: [docs/FULL_TTS_STT_EVALUATION.md](docs/FULL_TTS_STT_EVALUATION.md)
 
 ## Features
 
