@@ -1,0 +1,16 @@
+[workspace]
+members = ["server"]
+resolver = "2"
+
+[workspace.dependencies]
+qwen3-tts = { git = "https://github.com/alfonsodg/qwen3-tts-rs.git", branch = "main" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = false

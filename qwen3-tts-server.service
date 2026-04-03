@@ -1,0 +1,20 @@
+[Unit]
+Description=Qwen3-TTS Concurrent Server
+After=network.target
+
+[Service]
+Type=simple
+User=alfonsodg
+WorkingDirectory=/home/alfonsodg/qwen3-tts-server
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=MODEL_DIR=/home/alfonsodg/qwen3-tts-server/models/0.6b-base
+Environment=MAX_BATCH=8
+Environment=MAX_WAIT_MS=200
+Environment=PORT=8090
+Environment=RUST_LOG=info
+ExecStart=/home/alfonsodg/qwen3-tts-server/target/release/qwen3-tts-server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
