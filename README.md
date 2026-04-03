@@ -4,6 +4,8 @@ High-performance concurrent Rust TTS server for [Qwen3-TTS-12Hz-0.6B-Base](https
 
 Takes the upstream [qwen3-tts-rs](https://github.com/TrevorS/qwen3-tts-rs) single-stream engine (0.91x real-time) and optimizes it to **16.59x real-time** at batch=16 on a single NVIDIA L4.
 
+Uses a [modified fork of qwen3-tts-rs](https://github.com/alfonsodg/qwen3-tts-rs) with batched inference, ICL voice clone fixes, and concurrent server optimizations. See the [fork's CHANGELOG](https://github.com/alfonsodg/qwen3-tts-rs/blob/main/CHANGELOG.md) for all modifications.
+
 ## Performance (NVIDIA L4, 23GB)
 
 | Batch | Throughput | Latency/req | Concurrent calls (real-time) | VRAM |
