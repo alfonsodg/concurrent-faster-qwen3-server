@@ -1038,7 +1038,7 @@ impl Qwen3TTS {
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
             } else {
-                let gen_len = all_codes.len();
+                let ref_frames_clone = ref_frames.clone();
                 let mut combined = ref_frames;
                 combined.extend(all_codes.iter().cloned());
                 let total_len = combined.len();
@@ -1062,7 +1062,7 @@ impl Qwen3TTS {
                         }
                     }
                     // Prepend ref for vocoder context, decode, cut
-                    let mut combined2 = ref_frames.clone();
+                    let mut combined2 = ref_frames_clone;
                     combined2.extend(selected);
                     let total2 = combined2.len();
                     let mut audio2 = self.decode_codes(&combined2)?;
