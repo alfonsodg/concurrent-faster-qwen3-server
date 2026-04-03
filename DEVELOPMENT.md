@@ -118,12 +118,28 @@ Adaptive `max_length`: ~6 frames/word capped at 512 (vs default 2048). Reduces K
 | `dffa961` | Hardening (#11-#14) | Cargo profiles, mutex recovery, temp-file write check, explicit clone errors |
 | `19bc541` | Server unit tests (#15) | 10 tests covering API paths, Drop cleanup, metrics |
 | `f678165` | Fix ICL voice cloning shape mismatch (#16) | `get_codec_embedding_batch` unsqueeze(0) vs unsqueeze(1) |
+| `v0.4.7` | Fix ICL warm-up leak + onset preservation | Skip `ref_text_len - 3` warm-up frames before vocoder, prepend ref_codes, proportional cut. 15 iterations to find correct approach. |
 
 ### Failed experiments
 
 | Commit | Attempt | Result |
 |--------|---------|--------|
 | `b8c9667` | Batched initial sampling + batched embedding + parallel decoder | Regression — reverted in `ba84ceb` |
+| `15cd26a` | QuantizedKVCache U8 for batch>8 | Dequantize overhead (no fused kernels): 12.71x vs 16.59x RT |
+| v0.4.0 | ICL speed correction via audio resampling | Destroyed pitch (chipmunk audio) |
+| v0.4.2 | ICL speed correction via codec frame dropping | Same pitch destruction — vocoder needs consecutive frames |
+| v0.3.7-v0.4.1 | Proportional ICL warm-up cuts | Scale with target text length but warm-up is fixed |
+
+### ICL Voice Clone Warm-up Fix (v0.4.7)
+
+The Rust ICL implementation generates warm-up frames for `ref_text` before target text:
+
+1. **Skip warm-up frames**: `warmup = ref_text_tokens - 3` (fixed count, not proportional)
+2. **Prepend ref_codes** to remaining frames for vocoder context
+3. **Proportional cut** on decoded audio to remove ref_codes portion
+4. The `-3` margin (~240ms) preserves the onset of the first phoneme
+
+Key insight: warm-up is ~1 frame per ref_text token, independent of target text length.
 
 ## API
 
