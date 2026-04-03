@@ -294,23 +294,9 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
 fn decode_ref_audio(req: &SpeechRequest) -> Option<VoiceCloneData> {
     req.ref_audio.as_ref().and_then(|b64| {
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-        // Truncate ref audio to max 5 seconds (24kHz, 16-bit mono = 240000 bytes + 44 header)
-        let max_data_bytes = 5 * 24000 * 2; // 5s at 24kHz 16-bit
-        let truncated = if bytes.len() > 44 + max_data_bytes {
-            let mut out = bytes[..44].to_vec();
-            out.extend_from_slice(&bytes[44..44 + max_data_bytes]);
-            // Fix WAV data chunk size
-            let data_len = max_data_bytes as u32;
-            out[40..44].copy_from_slice(&data_len.to_le_bytes());
-            let riff_len = (36 + max_data_bytes) as u32;
-            out[4..8].copy_from_slice(&riff_len.to_le_bytes());
-            out
-        } else {
-            bytes
-        };
         let tmp = std::env::temp_dir().join(format!("ref_{}.wav",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
-        match std::fs::write(&tmp, &truncated) {
+        match std::fs::write(&tmp, &bytes) {
             Ok(_) => Some(VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone() }),
             Err(e) => { tracing::error!("Failed to write ref_audio temp file: {e}"); None }
         }

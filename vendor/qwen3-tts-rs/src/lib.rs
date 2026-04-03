@@ -1032,16 +1032,22 @@ impl Qwen3TTS {
         let _decode_span = tracing::info_span!("decode").entered();
 
         let audio = if let Some(ref_codes) = &prompt.ref_codes {
+            // ICL: prepend ref_codes, decode together, proportional cut (Python reference)
             let ref_frames = self.tensor_to_frame_codes(ref_codes)?;
             let ref_len = ref_frames.len();
             if all_codes.is_empty() {
                 AudioBuffer::new(vec![], 24000)
             } else {
+                let gen_len = all_codes.len();
                 let mut combined = ref_frames;
                 combined.extend(all_codes.iter().cloned());
                 let total_len = combined.len();
                 let mut audio = self.decode_codes(&combined)?;
                 let cut = ref_len * audio.len() / total_len.max(1);
+                tracing::info!(
+                    "ICL: ref={}fr gen={}fr total={}fr samples={} cut={}",
+                    ref_len, gen_len, total_len, audio.len(), cut
+                );
                 audio.samples = audio.samples[cut..].to_vec();
                 audio
             }
