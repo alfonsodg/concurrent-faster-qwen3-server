@@ -1043,7 +1043,7 @@ impl Qwen3TTS {
                 let ref_text_len = ref_text_ids.len();
                 let target_text_len = input_ids.len();
                 let total_text = ref_text_len + target_text_len + 1;
-                let warmup_frames = all_codes.len() * ref_text_len / total_text.max(1);
+                let warmup_frames = (all_codes.len() * ref_text_len / total_text.max(1)).saturating_sub(4);
                 let target_codes = if warmup_frames > 0 && warmup_frames < all_codes.len() {
                     &all_codes[warmup_frames..]
                 } else {
