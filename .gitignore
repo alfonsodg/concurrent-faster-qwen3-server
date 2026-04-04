@@ -38,3 +38,6 @@ REMOTE.md
 # Logs
 *.log
 qwen3-tts-server-v*
+
+# Environment
+.env
