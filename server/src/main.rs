@@ -150,7 +150,7 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
 
     let permit = match state.semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Queue full".into() })).into_response(),
+        Err(_) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Queue full".into() })).into_response(); },
     };
 
     let voice_clone = match decode_ref_audio(&req) {
@@ -167,6 +167,7 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
 
     if state.tx.send(batch_req).await.is_err() {
         drop(permit);
+        state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Engine down".into() })).into_response();
     }
 
@@ -197,6 +198,7 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
     // Submit to streaming worker
     let stream_req = StreamingRequest { text, language, temperature: req.temperature.unwrap_or(0.7), tx };
     if state.stream_tx.send(stream_req).await.is_err() {
+        state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Stream engine down".into() })).into_response();
     }
 
