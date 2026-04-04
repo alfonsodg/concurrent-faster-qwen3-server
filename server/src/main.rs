@@ -70,13 +70,26 @@ struct HealthResponse { status: &'static str, queue_depth: usize, max_batch: usi
 #[derive(Serialize)]
 struct ErrorResponse { error: String }
 
-fn parse_language(s: &str) -> Language {
+fn parse_language(s: &str) -> Result<Language, String> {
     match s.to_lowercase().as_str() {
-        "spanish" | "es" => Language::Spanish,
-        "english" | "en" => Language::English,
-        "french" | "fr" => Language::French,
-        _ => Language::Spanish,
+        "spanish" | "es" => Ok(Language::Spanish),
+        "english" | "en" => Ok(Language::English),
+        "french" | "fr" => Ok(Language::French),
+        other => Err(format!("unsupported language: {other}")),
     }
+}
+
+fn validate_request(req: &SpeechRequest) -> Result<(), (StatusCode, String)> {
+    if req.text.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "text must not be empty".into()));
+    }
+    parse_language(&req.language).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if let Some(t) = req.temperature {
+        if !(0.0..=1.0).contains(&t) {
+            return Err((StatusCode::BAD_REQUEST, format!("temperature must be 0.0-1.0, got {t}")));
+        }
+    }
+    Ok(())
 }
 
 fn audio_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
@@ -143,6 +156,10 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
 
 async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRequest>) -> Response {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    if let Err((status, msg)) = validate_request(&req) {
+        state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+        return (status, Json(ErrorResponse { error: msg })).into_response();
+    }
     if req.stream.unwrap_or(false) {
         state.metrics.requests_streaming.fetch_add(1, Ordering::Relaxed);
         return synthesize_streaming(state, req).await;
@@ -160,7 +177,7 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
 
     let (reply_tx, reply_rx) = oneshot::channel();
     let batch_req = BatchRequest {
-        text: req.text, language: parse_language(&req.language), voice_clone,
+        text: req.text, language: parse_language(&req.language).unwrap(), voice_clone,
         options: SynthesisOptions { temperature: req.temperature.unwrap_or(0.7), ..SynthesisOptions::default() },
         reply: reply_tx,
     };
@@ -190,7 +207,7 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
 }
 
 async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Response {
-    let language = parse_language(&req.language);
+    let language = parse_language(&req.language).unwrap();
     let text = req.text.clone();
 
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>(32);
@@ -371,12 +388,12 @@ mod tests {
 
     #[test]
     fn test_parse_language() {
-        assert!(matches!(parse_language("spanish"), Language::Spanish));
-        assert!(matches!(parse_language("es"), Language::Spanish));
-        assert!(matches!(parse_language("english"), Language::English));
-        assert!(matches!(parse_language("en"), Language::English));
-        assert!(matches!(parse_language("french"), Language::French));
-        assert!(matches!(parse_language("unknown"), Language::Spanish)); // default
+        assert!(matches!(parse_language("spanish"), Ok(Language::Spanish)));
+        assert!(matches!(parse_language("es"), Ok(Language::Spanish)));
+        assert!(matches!(parse_language("english"), Ok(Language::English)));
+        assert!(matches!(parse_language("en"), Ok(Language::English)));
+        assert!(matches!(parse_language("french"), Ok(Language::French)));
+        assert!(parse_language("unknown").is_err());
     }
 
     #[test]
