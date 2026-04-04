@@ -153,7 +153,10 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Queue full".into() })).into_response(),
     };
 
-    let voice_clone = decode_ref_audio(&req);
+    let voice_clone = match decode_ref_audio(&req) {
+        Ok(vc) => vc,
+        Err((status, msg)) => return (status, Json(ErrorResponse { error: msg })).into_response(),
+    };
 
     let (reply_tx, reply_rx) = oneshot::channel();
     let batch_req = BatchRequest {
@@ -291,16 +294,31 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>) -> mpsc::Sender<Strea
     tx
 }
 
-fn decode_ref_audio(req: &SpeechRequest) -> Option<VoiceCloneData> {
-    req.ref_audio.as_ref().and_then(|b64| {
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-        let tmp = std::env::temp_dir().join(format!("ref_{}.wav",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
-        match std::fs::write(&tmp, &bytes) {
-            Ok(_) => Some(VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone() }),
-            Err(e) => { tracing::error!("Failed to write ref_audio temp file: {e}"); None }
-        }
-    })
+/// Max ref_audio decoded size in bytes (default 10 MB)
+fn max_ref_audio_bytes() -> usize {
+    std::env::var("MAX_REF_AUDIO_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(10 * 1024 * 1024)
+}
+
+fn decode_ref_audio(req: &SpeechRequest) -> Result<Option<VoiceCloneData>, (StatusCode, String)> {
+    let b64 = match req.ref_audio.as_ref() {
+        Some(b) if !b.is_empty() => b,
+        _ => return Ok(None),
+    };
+    // base64 encodes 3 bytes as 4 chars; estimate decoded size without allocating
+    let estimated = b64.len() / 4 * 3;
+    let limit = max_ref_audio_bytes();
+    if estimated > limit {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("ref_audio exceeds {limit} byte limit")));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid ref_audio base64: {e}")))?;
+    if bytes.len() > limit {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("ref_audio exceeds {limit} byte limit")));
+    }
+    let tmp = std::env::temp_dir().join(format!("ref_{}.wav",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+    std::fs::write(&tmp, &bytes).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ref_audio: {e}")))?;
+    Ok(Some(VoiceCloneData { ref_audio_path: tmp, ref_text: req.ref_text.clone() }))
 }
 
 use tokio_stream::StreamExt;
@@ -404,8 +422,8 @@ mod tests {
             stream: None,
         };
         let result = decode_ref_audio(&req);
-        assert!(result.is_some());
-        let vc = result.unwrap();
+        assert!(result.is_ok());
+        let vc = result.unwrap().unwrap();
         assert!(vc.ref_audio_path.exists());
         assert_eq!(vc.ref_text, Some("ref".into()));
         // Drop should clean up
@@ -424,7 +442,7 @@ mod tests {
             temperature: None,
             stream: None,
         };
-        assert!(decode_ref_audio(&req).is_none());
+        assert!(decode_ref_audio(&req).is_err());
     }
 
     #[test]
@@ -437,7 +455,7 @@ mod tests {
             temperature: None,
             stream: None,
         };
-        assert!(decode_ref_audio(&req).is_none());
+        assert!(decode_ref_audio(&req).unwrap().is_none());
     }
 
     #[test]
