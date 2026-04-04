@@ -50,6 +50,12 @@ pub struct BatchEngineConfig {
 /// and processing them in batches.
 pub struct BatchEngine;
 
+/// Calculate adaptive max_length based on word count.
+pub fn adaptive_max_length(text: &str) -> usize {
+    let word_count = text.split_whitespace().count();
+    ((word_count * 6) + 50).clamp(100, 512)
+}
+
 impl BatchEngine {
     /// Start the batch engine on a dedicated thread.
     /// Returns a sender for submitting requests.
@@ -132,8 +138,7 @@ impl BatchEngine {
                 let requests: Vec<(String, qwen3_tts::Language, Option<SynthesisOptions>)> = batch
                     .iter()
                     .map(|r| {
-                        let word_count = r.text.split_whitespace().count();
-                        let adaptive_max = ((word_count * 6) + 50).clamp(100, 512);
+                        let adaptive_max = adaptive_max_length(&r.text);
                         let mut opts = r.options.clone();
                         opts.max_length = adaptive_max;
                         (r.text.clone(), r.language, Some(opts))
@@ -171,29 +176,8 @@ impl BatchEngine {
                             let mid = batch.len() / 2;
                             warn!(batch_size, mid, "OOM in batch, splitting and retrying");
                             let second_half: Vec<BatchRequest> = batch.drain(mid..).collect();
-                            // Re-queue second half by processing after first half
-                            // Process first half sequentially (safe)
-                            for req in batch {
-                                let t_req = Instant::now();
-                                let result = Self::process_single(model, &req);
-                                let gen_time = t_req.elapsed().as_secs_f32();
-                                let reply = match result {
-                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
-                                    Err(e) => Err(e),
-                                };
-                                let _ = req.reply.send(reply);
-                            }
-                            // Process second half sequentially
-                            for req in second_half {
-                                let t_req = Instant::now();
-                                let result = Self::process_single(model, &req);
-                                let gen_time = t_req.elapsed().as_secs_f32();
-                                let reply = match result {
-                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
-                                    Err(e) => Err(e),
-                                };
-                                let _ = req.reply.send(reply);
-                            }
+                            Self::process_sequential(model, batch);
+                            Self::process_sequential(model, second_half);
                             let total = t0.elapsed().as_secs_f32();
                             info!(total_secs = total, "OOM recovery complete (sequential fallback)");
                             continue;
@@ -204,22 +188,22 @@ impl BatchEngine {
             }
 
             // Fallback: sequential processing
-            for req in batch {
-                let t_req = Instant::now();
-                let result = Self::process_single(model, &req);
-                let gen_time = t_req.elapsed().as_secs_f32();
-                let reply = match result {
-                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
-                    Err(e) => Err(e),
-                };
-                let _ = req.reply.send(reply);
-            }
+            Self::process_sequential(model, batch);
 
             let total = t0.elapsed().as_secs_f32();
             info!(total_secs = total, "Sequential fallback complete");
         }
 
         Ok(())
+    }
+
+    fn process_sequential(model: &Qwen3TTS, batch: Vec<BatchRequest>) {
+        for req in batch {
+            let t_req = Instant::now();
+            let result = Self::process_single(model, &req);
+            let gen_time = t_req.elapsed().as_secs_f32();
+            let _ = req.reply.send(result.map(|audio| BatchResult { audio, gen_time_secs: gen_time }));
+        }
     }
 
     fn process_single(model: &Qwen3TTS, req: &BatchRequest) -> Result<AudioBuffer> {
