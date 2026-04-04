@@ -35,7 +35,7 @@ fn test_streaming_custom_voice() {
     let mut chunk_count = 0usize;
     for chunk_result in session {
         let audio = chunk_result.expect("chunk generation failed");
-        assert!(audio.len() > 0, "chunk {chunk_count} was empty");
+        assert!(!audio.is_empty(), "chunk {chunk_count} was empty");
         assert_eq!(audio.sample_rate, 24000);
         total_samples += audio.len();
         chunk_count += 1;
@@ -80,7 +80,7 @@ fn test_streaming_voice_design() {
     let mut chunk_count = 0usize;
     for chunk_result in session {
         let audio = chunk_result.expect("chunk generation failed");
-        assert!(audio.len() > 0, "chunk {chunk_count} was empty");
+        assert!(!audio.is_empty(), "chunk {chunk_count} was empty");
         assert_eq!(audio.sample_rate, 24000);
         total_samples += audio.len();
         chunk_count += 1;

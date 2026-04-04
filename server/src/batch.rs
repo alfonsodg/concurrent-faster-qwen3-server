@@ -133,7 +133,7 @@ impl BatchEngine {
                     .iter()
                     .map(|r| {
                         let word_count = r.text.split_whitespace().count();
-                        let adaptive_max = ((word_count * 6) + 50).min(512).max(100);
+                        let adaptive_max = ((word_count * 6) + 50).clamp(100, 512);
                         let mut opts = r.options.clone();
                         opts.max_length = adaptive_max;
                         (r.text.clone(), r.language, Some(opts))
@@ -175,7 +175,7 @@ impl BatchEngine {
                             // Process first half sequentially (safe)
                             for req in batch {
                                 let t_req = Instant::now();
-                                let result = Self::process_single(&model, &req);
+                                let result = Self::process_single(model, &req);
                                 let gen_time = t_req.elapsed().as_secs_f32();
                                 let reply = match result {
                                     Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
@@ -186,7 +186,7 @@ impl BatchEngine {
                             // Process second half sequentially
                             for req in second_half {
                                 let t_req = Instant::now();
-                                let result = Self::process_single(&model, &req);
+                                let result = Self::process_single(model, &req);
                                 let gen_time = t_req.elapsed().as_secs_f32();
                                 let reply = match result {
                                     Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
@@ -206,7 +206,7 @@ impl BatchEngine {
             // Fallback: sequential processing
             for req in batch {
                 let t_req = Instant::now();
-                let result = Self::process_single(&model, &req);
+                let result = Self::process_single(model, &req);
                 let gen_time = t_req.elapsed().as_secs_f32();
                 let reply = match result {
                     Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),

@@ -29,7 +29,7 @@ fn main() {
         let mut handles = Vec::new();
         for i in 0..n {
             let rx = receivers.remove(0);
-            let t0_clone = t0.clone();
+            let t0_clone = t0;
             let ttfa_clone = ttfa.clone();
             handles.push(std::thread::spawn(move || {
                 let mut total_samples = 0usize;

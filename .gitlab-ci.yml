@@ -81,7 +81,6 @@ go-lint:
 rust-lint:
   stage: check
   image: rust:1.84-alpine
-  allow_failure: true
   before_script:
     - apk add --no-cache musl-dev
   script:

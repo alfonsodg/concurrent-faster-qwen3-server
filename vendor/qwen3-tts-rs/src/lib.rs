@@ -1251,9 +1251,9 @@ impl Qwen3TTS {
 
         let mut semantic_tokens: Vec<Tensor> = Vec::with_capacity(n);
         let mut semantic_ids: Vec<u32> = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, &id) in init_ids.iter().enumerate().take(n) {
             semantic_tokens.push(init_tokens.i(i)?);
-            semantic_ids.push(init_ids[i]);
+            semantic_ids.push(id);
         }
 
         // Pre-allocate zero tensor for done sequences (avoid per-frame allocation)
@@ -1344,6 +1344,7 @@ impl Qwen3TTS {
 
             // Update per-sequence state
             let mut new_tokens: Vec<Tensor> = Vec::with_capacity(n);
+            #[allow(clippy::needless_range_loop)]
             for i in 0..n {
                 let tok = all_new_tokens.i(i)?;
                 new_tokens.push(tok.clone());
@@ -1353,6 +1354,7 @@ impl Qwen3TTS {
             // Batched EOS check: stack all tokens → single GPU→CPU transfer
             let stacked = Tensor::stack(&new_tokens, 0)?.flatten_all()?;
             let all_ids: Vec<u32> = stacked.to_vec1()?;
+            #[allow(clippy::manual_memcpy)]
             for i in 0..n {
                 semantic_tokens[i] = new_tokens[i].clone();
                 semantic_ids[i] = all_ids[i];
@@ -1361,6 +1363,7 @@ impl Qwen3TTS {
             // Bulk transfer frame codes (single sync)
             if !gpu_frames.iter().all(|f| f.is_none()) {
                 let mut to_transfer: Vec<(usize, &Tensor)> = Vec::new();
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..n {
                     if let Some(ref frame) = gpu_frames[i] {
                         to_transfer.push((i, frame));
@@ -1422,6 +1425,7 @@ impl Qwen3TTS {
 
     /// Build a batched causal attention mask with padding support.
     /// Returns [N, 1, seq_len, seq_len] mask where padding positions are -inf.
+    #[allow(clippy::needless_range_loop)]
     fn build_batched_causal_mask(
         &self,
         attention_masks: &[Vec<f32>],

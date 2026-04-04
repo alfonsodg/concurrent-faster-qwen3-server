@@ -198,7 +198,7 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
     }
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = Body::from_stream(stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))));
+    let body = Body::from_stream(stream.map(|r| r.map_err(std::io::Error::other)));
 
     Response::builder()
         .status(StatusCode::OK)
@@ -347,7 +347,6 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn test_parse_language() {
@@ -409,7 +408,7 @@ mod tests {
         assert!(vc.ref_audio_path.exists());
         assert_eq!(vc.ref_text, Some("ref".into()));
         // Drop should clean up
-        let path = vc.ref_audio_path.clone();
+        let _path = vc.ref_audio_path.clone();
         drop(vc);
         // VoiceCloneData is in batch module, Drop cleans up
     }

@@ -13,7 +13,7 @@ fn main() {
     for n in [1, 2, 4, 8, 16] {
         let text = "Buenos días, le habla el asistente número uno. ¿En qué puedo ayudarle?";
         let word_count = text.split_whitespace().count();
-        let adaptive_max = ((word_count * 6) + 50).min(512).max(100);
+        let adaptive_max = ((word_count * 6) + 50).clamp(100, 512);
 
         let requests: Vec<(String, Language, Option<SynthesisOptions>)> = (0..n)
             .map(|i| (
