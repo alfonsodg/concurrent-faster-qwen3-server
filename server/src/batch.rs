@@ -23,6 +23,7 @@ pub struct BatchRequest {
 pub struct VoiceCloneData {
     pub ref_audio_path: std::path::PathBuf,
     pub ref_text: Option<String>,
+    pub audio_hash: u64,
 }
 
 impl Drop for VoiceCloneData {
@@ -57,17 +58,32 @@ pub fn adaptive_max_length(text: &str) -> usize {
 }
 
 /// Build voice clone prompts for a batch, returning failed indices.
-/// Shared between batch engine and streaming worker (#30).
+/// Uses cache to avoid re-running speaker encoder for repeated ref_audio.
 pub fn build_voice_clone_prompts(
     model: &Qwen3TTS,
     voice_clones: &[Option<&VoiceCloneData>],
-) -> (Vec<Option<qwen3_tts::VoiceClonePrompt>>, Vec<usize>) {
+    cache: &std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<qwen3_tts::VoiceClonePrompt>>>,
+) -> (Vec<Option<std::sync::Arc<qwen3_tts::VoiceClonePrompt>>>, Vec<usize>) {
     let mut failed = Vec::new();
     let prompts = voice_clones.iter().enumerate().map(|(idx, vc)| {
         vc.and_then(|vc| {
+            // Check cache first
+            if let Ok(c) = cache.lock() {
+                if let Some(cached) = c.get(&vc.audio_hash) {
+                    info!(hash = vc.audio_hash, "Voice clone prompt cache hit");
+                    return Some(cached.clone());
+                }
+            }
             match qwen3_tts::AudioBuffer::load(&vc.ref_audio_path) {
                 Ok(ref_buf) => match model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()) {
-                    Ok(p) => Some(p),
+                    Ok(p) => {
+                        let arc = std::sync::Arc::new(p);
+                        if let Ok(mut c) = cache.lock() {
+                            if c.len() >= 10 { c.clear(); } // simple eviction
+                            c.insert(vc.audio_hash, arc.clone());
+                        }
+                        Some(arc)
+                    }
                     Err(e) => { warn!("Voice clone prompt failed: {e:#}"); failed.push(idx); None }
                 },
                 Err(e) => { warn!("Voice clone ref_audio load failed: {e:#}"); failed.push(idx); None }
@@ -77,14 +93,16 @@ pub fn build_voice_clone_prompts(
     (prompts, failed)
 }
 
+pub type PromptCache = Arc<std::sync::Mutex<std::collections::HashMap<u64, Arc<qwen3_tts::VoiceClonePrompt>>>>;
+
 impl BatchEngine {
     /// Start the batch engine on a dedicated thread.
     /// Returns a sender for submitting requests.
-    pub fn start(model: Arc<Qwen3TTS>, config: BatchEngineConfig) -> mpsc::Sender<BatchRequest> {
+    pub fn start(model: Arc<Qwen3TTS>, config: BatchEngineConfig, cache: PromptCache) -> mpsc::Sender<BatchRequest> {
         let (tx, rx) = mpsc::channel::<BatchRequest>(config.max_batch_size * 4);
 
         std::thread::spawn(move || {
-            if let Err(e) = Self::run_loop(rx, config, &model) {
+            if let Err(e) = Self::run_loop(rx, config, &model, &cache) {
                 tracing::error!("Batch engine crashed: {e:#}");
             }
         });
@@ -96,6 +114,7 @@ impl BatchEngine {
         mut rx: mpsc::Receiver<BatchRequest>,
         config: BatchEngineConfig,
         model: &Qwen3TTS,
+        cache: &PromptCache,
     ) -> Result<()> {
         info!("Batch engine ready, max_batch={}", config.max_batch_size);
 
@@ -132,7 +151,7 @@ impl BatchEngine {
             if batch_size > 1 {
                 // Build per-request voice clone prompts
                 let vc_refs: Vec<Option<&VoiceCloneData>> = batch.iter().map(|r| r.voice_clone.as_ref()).collect();
-                let (prompts, failed_indices) = build_voice_clone_prompts(model, &vc_refs);
+                let (prompts, failed_indices) = build_voice_clone_prompts(model, &vc_refs, cache);
 
                 // Send errors for failed voice clone requests before batching
                 for &idx in failed_indices.iter().rev() {
@@ -154,7 +173,7 @@ impl BatchEngine {
                         (r.text.clone(), r.language, Some(opts))
                     })
                     .collect();
-                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = {
+                let prompts: Vec<Option<Arc<qwen3_tts::VoiceClonePrompt>>> = {
                     let mut kept = Vec::new();
                     for (idx, p) in prompts.into_iter().enumerate() {
                         if !failed_indices.contains(&idx) { kept.push(p); }
@@ -162,7 +181,7 @@ impl BatchEngine {
                     kept
                 };
                 let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
-                    prompts.iter().map(|p| p.as_ref()).collect();
+                    prompts.iter().map(|p| p.as_deref()).collect();
 
                 match model.synthesize_batch_with_voices(&requests, &prompt_refs) {
                     Ok(audios) => {
@@ -186,8 +205,8 @@ impl BatchEngine {
                             let mid = batch.len() / 2;
                             warn!(batch_size, mid, "OOM in batch, splitting and retrying");
                             let second_half: Vec<BatchRequest> = batch.drain(mid..).collect();
-                            Self::process_sequential(model, batch);
-                            Self::process_sequential(model, second_half);
+                            Self::process_sequential(model, batch, cache);
+                            Self::process_sequential(model, second_half, cache);
                             let total = t0.elapsed().as_secs_f32();
                             info!(total_secs = total, "OOM recovery complete (sequential fallback)");
                             continue;
@@ -198,7 +217,7 @@ impl BatchEngine {
             }
 
             // Fallback: sequential processing
-            Self::process_sequential(model, batch);
+            Self::process_sequential(model, batch, cache);
 
             let total = t0.elapsed().as_secs_f32();
             info!(total_secs = total, "Sequential fallback complete");
@@ -207,22 +226,31 @@ impl BatchEngine {
         Ok(())
     }
 
-    fn process_sequential(model: &Qwen3TTS, batch: Vec<BatchRequest>) {
+    fn process_sequential(model: &Qwen3TTS, batch: Vec<BatchRequest>, cache: &PromptCache) {
         for req in batch {
             let t_req = Instant::now();
-            let result = Self::process_single(model, &req);
+            let result = Self::process_single(model, &req, cache);
             let gen_time = t_req.elapsed().as_secs_f32();
             let _ = req.reply.send(result.map(|audio| BatchResult { audio, gen_time_secs: gen_time }));
         }
     }
 
-    fn process_single(model: &Qwen3TTS, req: &BatchRequest) -> Result<AudioBuffer> {
+    fn process_single(model: &Qwen3TTS, req: &BatchRequest, cache: &PromptCache) -> Result<AudioBuffer> {
         if let Some(vc) = &req.voice_clone {
-            let ref_buf = AudioBuffer::load(&vc.ref_audio_path)?;
-            let prompt = model.create_voice_clone_prompt(
-                &ref_buf,
-                vc.ref_text.as_deref(),
-            )?;
+            // Check cache
+            let cached = cache.lock().ok().and_then(|c| c.get(&vc.audio_hash).cloned());
+            let prompt = if let Some(p) = cached {
+                info!(hash = vc.audio_hash, "Voice clone prompt cache hit (single)");
+                p
+            } else {
+                let ref_buf = AudioBuffer::load(&vc.ref_audio_path)?;
+                let p = Arc::new(model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref())?);
+                if let Ok(mut c) = cache.lock() {
+                    if c.len() >= 10 { c.clear(); }
+                    c.insert(vc.audio_hash, p.clone());
+                }
+                p
+            };
             let mut opts = req.options.clone();
             // Cap x_vector max_length to prevent OOM on large models
             if vc.ref_text.is_none() {

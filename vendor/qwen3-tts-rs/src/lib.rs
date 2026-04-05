@@ -1614,7 +1614,16 @@ impl Qwen3TTS {
             for i in 0..n {
                 if !done[i] {
                     if let Some(eos_id) = gen_config.eos_token_id {
-                        if semantic_ids[i] == eos_id { done[i] = true; }
+                        if semantic_ids[i] == eos_id {
+                            done[i] = true;
+                            // Flush buffered frames immediately on EOS
+                            if !frame_buffers[i].is_empty() {
+                                if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
+                                    let _ = senders[i].send(audio);
+                                }
+                                frame_buffers[i].clear();
+                            }
+                        }
                     }
                 }
             }
@@ -1686,7 +1695,7 @@ impl Qwen3TTS {
             // Decode and send chunks every chunk_frames
             if (frame_idx + 1) % chunk_frames == 0 {
                 for i in 0..n {
-                    if frame_buffers[i].is_empty() { continue; }
+                    if done[i] || frame_buffers[i].is_empty() { continue; }
                     if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
                         let _ = senders[i].send(audio);
                     }
@@ -1695,9 +1704,9 @@ impl Qwen3TTS {
             }
         }
 
-        // Flush remaining frames
+        // Flush remaining frames (only for sequences that haven't hit EOS mid-chunk)
         for i in 0..n {
-            if !frame_buffers[i].is_empty() {
+            if !done[i] && !frame_buffers[i].is_empty() {
                 if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
                     let _ = senders[i].send(audio);
                 }
