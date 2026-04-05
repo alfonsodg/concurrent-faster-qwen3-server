@@ -47,9 +47,9 @@ Full comparison with 29+ models: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALU
 ### 1. Download the binary
 
 ```bash
-# From GitLab package registry
-curl -o qwen3-tts-server \
-  "https://scovil.labtau.com/api/v4/projects/622/packages/generic/qwen3-tts-server/v0.5.2/qwen3-tts-server-v0.5.2-linux-x86_64"
+# From GitHub releases
+curl -L -o qwen3-tts-server \
+  "https://github.com/alfonsodg/concurrent-faster-qwen3-server/releases/download/v0.5.2/qwen3-tts-server-v0.5.2-linux-x86_64"
 chmod +x qwen3-tts-server
 ```
 
@@ -257,8 +257,8 @@ sudo apt install cmake pkg-config libssl-dev libasound2-dev libclang-dev clang
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone git@scovil.labtau.com:ccvass/ai-audio/qwen3-tts-server.git
-cd qwen3-tts-server
+git clone https://github.com/alfonsodg/concurrent-faster-qwen3-server.git
+cd concurrent-faster-qwen3-server
 cargo build --release --features cuda,flash-attn
 
 # Binary at target/release/qwen3-tts-server
