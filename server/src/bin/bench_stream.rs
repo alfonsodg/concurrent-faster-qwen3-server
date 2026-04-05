@@ -29,7 +29,7 @@ fn main() {
         let mut handles = Vec::new();
         for i in 0..n {
             let rx = receivers.remove(0);
-            let t0_clone = t0.clone();
+            let t0_clone = t0;
             let ttfa_clone = ttfa.clone();
             handles.push(std::thread::spawn(move || {
                 let mut total_samples = 0usize;
@@ -47,7 +47,7 @@ fn main() {
 
         // Run batched streaming
         let chunk_frames = 5; // ~400ms audio per chunk
-        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames) {
+        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames, &vec![None; requests.len()]) {
             println!("Batch stream {n}: FAILED: {e:#}");
             continue;
         }

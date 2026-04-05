@@ -50,6 +50,33 @@ pub struct BatchEngineConfig {
 /// and processing them in batches.
 pub struct BatchEngine;
 
+/// Calculate adaptive max_length based on word count.
+pub fn adaptive_max_length(text: &str) -> usize {
+    let word_count = text.split_whitespace().count();
+    ((word_count * 6) + 50).clamp(100, 512)
+}
+
+/// Build voice clone prompts for a batch, returning failed indices.
+/// Shared between batch engine and streaming worker (#30).
+pub fn build_voice_clone_prompts(
+    model: &Qwen3TTS,
+    voice_clones: &[Option<&VoiceCloneData>],
+) -> (Vec<Option<qwen3_tts::VoiceClonePrompt>>, Vec<usize>) {
+    let mut failed = Vec::new();
+    let prompts = voice_clones.iter().enumerate().map(|(idx, vc)| {
+        vc.and_then(|vc| {
+            match qwen3_tts::AudioBuffer::load(&vc.ref_audio_path) {
+                Ok(ref_buf) => match model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()) {
+                    Ok(p) => Some(p),
+                    Err(e) => { warn!("Voice clone prompt failed: {e:#}"); failed.push(idx); None }
+                },
+                Err(e) => { warn!("Voice clone ref_audio load failed: {e:#}"); failed.push(idx); None }
+            }
+        })
+    }).collect();
+    (prompts, failed)
+}
+
 impl BatchEngine {
     /// Start the batch engine on a dedicated thread.
     /// Returns a sender for submitting requests.
@@ -103,23 +130,9 @@ impl BatchEngine {
             let t0 = Instant::now();
 
             if batch_size > 1 {
-                // Build per-request voice clone prompts; fail requests where clone was requested but failed
-                let mut failed_indices = Vec::new();
-                let prompts: Vec<Option<qwen3_tts::VoiceClonePrompt>> = batch
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, r)| {
-                        r.voice_clone.as_ref().and_then(|vc| {
-                            match qwen3_tts::AudioBuffer::load(&vc.ref_audio_path) {
-                                Ok(ref_buf) => match model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref()) {
-                                    Ok(prompt) => Some(prompt),
-                                    Err(e) => { warn!("Voice clone prompt failed: {e:#}"); failed_indices.push(idx); None }
-                                },
-                                Err(e) => { warn!("Voice clone ref_audio load failed: {e:#}"); failed_indices.push(idx); None }
-                            }
-                        })
-                    })
-                    .collect();
+                // Build per-request voice clone prompts
+                let vc_refs: Vec<Option<&VoiceCloneData>> = batch.iter().map(|r| r.voice_clone.as_ref()).collect();
+                let (prompts, failed_indices) = build_voice_clone_prompts(model, &vc_refs);
 
                 // Send errors for failed voice clone requests before batching
                 for &idx in failed_indices.iter().rev() {
@@ -132,10 +145,12 @@ impl BatchEngine {
                 let requests: Vec<(String, qwen3_tts::Language, Option<SynthesisOptions>)> = batch
                     .iter()
                     .map(|r| {
-                        let word_count = r.text.split_whitespace().count();
-                        let adaptive_max = ((word_count * 6) + 50).min(512).max(100);
                         let mut opts = r.options.clone();
-                        opts.max_length = adaptive_max;
+                        // Only skip adaptive cap for ICL (has ref_text); x_vector is fine with it
+                        let is_icl = r.voice_clone.as_ref().map_or(false, |vc| vc.ref_text.is_some());
+                        if !is_icl {
+                            opts.max_length = adaptive_max_length(&r.text);
+                        }
                         (r.text.clone(), r.language, Some(opts))
                     })
                     .collect();
@@ -171,29 +186,8 @@ impl BatchEngine {
                             let mid = batch.len() / 2;
                             warn!(batch_size, mid, "OOM in batch, splitting and retrying");
                             let second_half: Vec<BatchRequest> = batch.drain(mid..).collect();
-                            // Re-queue second half by processing after first half
-                            // Process first half sequentially (safe)
-                            for req in batch {
-                                let t_req = Instant::now();
-                                let result = Self::process_single(&model, &req);
-                                let gen_time = t_req.elapsed().as_secs_f32();
-                                let reply = match result {
-                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
-                                    Err(e) => Err(e),
-                                };
-                                let _ = req.reply.send(reply);
-                            }
-                            // Process second half sequentially
-                            for req in second_half {
-                                let t_req = Instant::now();
-                                let result = Self::process_single(&model, &req);
-                                let gen_time = t_req.elapsed().as_secs_f32();
-                                let reply = match result {
-                                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
-                                    Err(e) => Err(e),
-                                };
-                                let _ = req.reply.send(reply);
-                            }
+                            Self::process_sequential(model, batch);
+                            Self::process_sequential(model, second_half);
                             let total = t0.elapsed().as_secs_f32();
                             info!(total_secs = total, "OOM recovery complete (sequential fallback)");
                             continue;
@@ -204,22 +198,22 @@ impl BatchEngine {
             }
 
             // Fallback: sequential processing
-            for req in batch {
-                let t_req = Instant::now();
-                let result = Self::process_single(&model, &req);
-                let gen_time = t_req.elapsed().as_secs_f32();
-                let reply = match result {
-                    Ok(audio) => Ok(BatchResult { audio, gen_time_secs: gen_time }),
-                    Err(e) => Err(e),
-                };
-                let _ = req.reply.send(reply);
-            }
+            Self::process_sequential(model, batch);
 
             let total = t0.elapsed().as_secs_f32();
             info!(total_secs = total, "Sequential fallback complete");
         }
 
         Ok(())
+    }
+
+    fn process_sequential(model: &Qwen3TTS, batch: Vec<BatchRequest>) {
+        for req in batch {
+            let t_req = Instant::now();
+            let result = Self::process_single(model, &req);
+            let gen_time = t_req.elapsed().as_secs_f32();
+            let _ = req.reply.send(result.map(|audio| BatchResult { audio, gen_time_secs: gen_time }));
+        }
     }
 
     fn process_single(model: &Qwen3TTS, req: &BatchRequest) -> Result<AudioBuffer> {
@@ -229,11 +223,16 @@ impl BatchEngine {
                 &ref_buf,
                 vc.ref_text.as_deref(),
             )?;
+            let mut opts = req.options.clone();
+            // Cap x_vector max_length to prevent OOM on large models
+            if vc.ref_text.is_none() {
+                opts.max_length = adaptive_max_length(&req.text);
+            }
             model.synthesize_voice_clone(
                 &req.text,
                 &prompt,
                 req.language,
-                Some(req.options.clone()),
+                Some(opts),
             )
         } else {
             model.synthesize_with_voice(
