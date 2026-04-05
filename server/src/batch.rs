@@ -16,6 +16,7 @@ pub struct BatchRequest {
     pub text: String,
     pub language: Language,
     pub voice_clone: Option<VoiceCloneData>,
+    pub cached_prompt: Option<Arc<qwen3_tts::VoiceClonePrompt>>,
     pub options: SynthesisOptions,
     pub reply: oneshot::Sender<Result<BatchResult>>,
 }
@@ -236,12 +237,14 @@ impl BatchEngine {
     }
 
     fn process_single(model: &Qwen3TTS, req: &BatchRequest, cache: &PromptCache) -> Result<AudioBuffer> {
-        if let Some(vc) = &req.voice_clone {
-            // Check cache
+        // Resolve voice clone prompt: cached_prompt > voice_clone > default
+        let prompt = if let Some(p) = &req.cached_prompt {
+            Some(p.clone())
+        } else if let Some(vc) = &req.voice_clone {
             let cached = cache.lock().ok().and_then(|c| c.get(&vc.audio_hash).cloned());
-            let prompt = if let Some(p) = cached {
+            if let Some(p) = cached {
                 info!(hash = vc.audio_hash, "Voice clone prompt cache hit (single)");
-                p
+                Some(p)
             } else {
                 let ref_buf = AudioBuffer::load(&vc.ref_audio_path)?;
                 let p = Arc::new(model.create_voice_clone_prompt(&ref_buf, vc.ref_text.as_deref())?);
@@ -249,19 +252,16 @@ impl BatchEngine {
                     if c.len() >= 10 { c.clear(); }
                     c.insert(vc.audio_hash, p.clone());
                 }
-                p
-            };
+                Some(p)
+            }
+        } else { None };
+
+        if let Some(prompt) = prompt {
             let mut opts = req.options.clone();
-            // Cap x_vector max_length to prevent OOM on large models
-            if vc.ref_text.is_none() {
+            if req.voice_clone.as_ref().map_or(true, |vc| vc.ref_text.is_none()) {
                 opts.max_length = adaptive_max_length(&req.text);
             }
-            model.synthesize_voice_clone(
-                &req.text,
-                &prompt,
-                req.language,
-                Some(opts),
-            )
+            model.synthesize_voice_clone(&req.text, &prompt, req.language, Some(opts))
         } else {
             model.synthesize_with_voice(
                 &req.text,
