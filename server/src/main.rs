@@ -59,6 +59,7 @@ struct AppState {
     max_batch: usize,
     metrics: Arc<Metrics>,
     prompt_cache: Arc<std::sync::Mutex<HashMap<u64, Arc<qwen3_tts::VoiceClonePrompt>>>>,
+    model: Arc<qwen3_tts::Qwen3TTS>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +75,23 @@ struct SpeechRequest {
     temperature: Option<f64>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    voice_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PreloadRequest {
+    ref_audio: String,
+    #[serde(default)]
+    ref_text: Option<String>,
+    #[serde(default)]
+    voice_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PreloadResponse {
+    voice_id: String,
+    cached: bool,
 }
 
 fn default_language() -> String { "spanish".into() }
@@ -142,6 +160,46 @@ fn wav_header(sample_rate: u32, data_len: u32) -> Vec<u8> {
     h
 }
 
+
+async fn preload_embedding(State(state): State<Arc<AppState>>, Json(req): Json<PreloadRequest>) -> Response {
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&req.ref_audio) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("invalid base64: {e}") })).into_response(),
+    };
+    let audio_hash = hash_bytes(&bytes);
+    let voice_id = req.voice_id.unwrap_or_else(|| format!("{:016x}", audio_hash));
+
+    // Check if already cached (by audio hash or voice_id name)
+    let vid_hash = hash_bytes(voice_id.as_bytes());
+    if let Ok(c) = state.prompt_cache.lock() {
+        if c.contains_key(&audio_hash) || c.contains_key(&vid_hash) {
+            return Json(PreloadResponse { voice_id, cached: true }).into_response();
+        }
+    }
+
+    // Write temp file, load, encode
+    let tmp = std::env::temp_dir().join(format!("preload_{:016x}.wav", rand_u64()));
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{e}") })).into_response();
+    }
+    let result = (|| -> anyhow::Result<Arc<qwen3_tts::VoiceClonePrompt>> {
+        let ref_buf = qwen3_tts::AudioBuffer::load(&tmp)?;
+        let prompt = state.model.create_voice_clone_prompt(&ref_buf, req.ref_text.as_deref())?;
+        Ok(Arc::new(prompt))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+
+    match result {
+        Ok(prompt) => {
+            if let Ok(mut c) = state.prompt_cache.lock() {
+                c.insert(audio_hash, prompt.clone());
+                c.insert(vid_hash, prompt); // also cache by voice_id name
+            }
+            Json(PreloadResponse { voice_id, cached: false }).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("{e}") })).into_response(),
+    }
+}
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let queue = state.max_inflight.saturating_sub(state.semaphore.available_permits());
     Json(HealthResponse { status: "ok", queue_depth: queue, max_batch: state.max_batch })
@@ -185,14 +243,29 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
         Err(_) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Queue full".into() })).into_response(); },
     };
 
-    let voice_clone = match decode_ref_audio(&req) {
-        Ok(vc) => vc,
-        Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
+    // Resolve voice: voice_id (cached) > ref_audio (encode)
+    let (voice_clone, cached_prompt) = if let Some(vid) = &req.voice_id {
+        let hash = hash_bytes(vid.as_bytes());
+        let prompt = state.prompt_cache.lock().ok()
+            .and_then(|c| c.get(&hash).or_else(|| {
+                // Try parsing voice_id as hex hash
+                u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h))
+            }).cloned());
+        match prompt {
+            Some(p) => (None, Some(p)),
+            None => return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("voice_id '{vid}' not found — preload first") })).into_response(),
+        }
+    } else {
+        let vc = match decode_ref_audio(&req) {
+            Ok(vc) => vc,
+            Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
+        };
+        (vc, None)
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
     let batch_req = BatchRequest {
-        text: req.text, language: parse_language(&req.language).unwrap(), voice_clone,
+        text: req.text, language: parse_language(&req.language).unwrap(), voice_clone, cached_prompt,
         options: SynthesisOptions { temperature: req.temperature.unwrap_or(0.7), ..SynthesisOptions::default() },
         reply: reply_tx,
     };
@@ -229,15 +302,26 @@ async fn synthesize_streaming(state: Arc<AppState>, req: SpeechRequest) -> Respo
     let language = parse_language(&req.language).unwrap();
     let text = req.text.clone();
 
-    let voice_clone = match decode_ref_audio(&req) {
-        Ok(vc) => vc,
-        Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
+    // Resolve voice: voice_id (cached) > ref_audio (encode)
+    let (voice_clone, cached_prompt) = if let Some(vid) = &req.voice_id {
+        let hash = hash_bytes(vid.as_bytes());
+        let prompt = state.prompt_cache.lock().ok()
+            .and_then(|c| c.get(&hash).or_else(|| u64::from_str_radix(vid, 16).ok().and_then(|h| c.get(&h))).cloned());
+        match prompt {
+            Some(p) => (None, Some(p)),
+            None => return (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("voice_id '{vid}' not found") })).into_response(),
+        }
+    } else {
+        let vc = match decode_ref_audio(&req) {
+            Ok(vc) => vc,
+            Err((status, msg)) => { state.metrics.errors_total.fetch_add(1, Ordering::Relaxed); return (status, Json(ErrorResponse { error: msg })).into_response(); },
+        };
+        (vc, None)
     };
 
     let (tx, mut rx) = mpsc::channel::<Result<Vec<u8>, String>>(32);
 
-    // Submit to streaming worker — fail fast if queue full (#33)
-    let stream_req = StreamingRequest { text, language, temperature: req.temperature.unwrap_or(0.7), voice_clone, tx };
+    let stream_req = StreamingRequest { text, language, temperature: req.temperature.unwrap_or(0.7), voice_clone, cached_prompt, tx };
     if let Err(_) = state.stream_tx.try_send(stream_req) {
         state.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "Stream queue full".into() })).into_response();
@@ -272,6 +356,7 @@ struct StreamingRequest {
     language: Language,
     temperature: f64,
     voice_clone: Option<VoiceCloneData>,
+    cached_prompt: Option<Arc<qwen3_tts::VoiceClonePrompt>>,
     tx: mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
@@ -316,25 +401,43 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
             let n = batch.len();
             info!(batch_size = n, "Streaming batch");
 
-            // Build voice clone prompts — fail requests where clone was requested but failed (#27)
-            let vc_refs: Vec<Option<&VoiceCloneData>> = batch.iter().map(|r| r.voice_clone.as_ref()).collect();
-            let (prompts, failed) = build_voice_clone_prompts(&model, &vc_refs, &cache);
+            // Build voice clone prompts: use cached_prompt if available, else encode
+            let mut prompts: Vec<Option<std::sync::Arc<qwen3_tts::VoiceClonePrompt>>> = Vec::with_capacity(n);
+            let mut to_remove: Vec<usize> = Vec::new();
+            for (idx, req) in batch.iter().enumerate() {
+                if let Some(p) = &req.cached_prompt {
+                    prompts.push(Some(p.clone()));
+                } else if req.voice_clone.is_some() {
+                    prompts.push(None); // placeholder, will be filled below
+                } else {
+                    prompts.push(None);
+                }
+            }
+            // Build prompts for requests that need encoding
+            let needs_encode: Vec<(usize, &VoiceCloneData)> = batch.iter().enumerate()
+                .filter(|(_, r)| r.cached_prompt.is_none() && r.voice_clone.is_some())
+                .map(|(i, r)| (i, r.voice_clone.as_ref().unwrap()))
+                .collect();
+            if !needs_encode.is_empty() {
+                let vc_refs: Vec<Option<&VoiceCloneData>> = batch.iter()
+                    .map(|r| if r.cached_prompt.is_none() { r.voice_clone.as_ref() } else { None })
+                    .collect();
+                let (encoded, failed) = build_voice_clone_prompts(&model, &vc_refs, &cache);
+                for &idx in failed.iter().rev() {
+                    to_remove.push(idx);
+                }
+                for (idx, p) in encoded.into_iter().enumerate() {
+                    if prompts[idx].is_none() { prompts[idx] = p; }
+                }
+            }
 
-            // Send error to failed voice clone requests instead of silent fallback
-            for &idx in failed.iter().rev() {
+            // Send error to failed voice clone requests
+            for &idx in to_remove.iter().rev() {
+                prompts.remove(idx);
                 let req = batch.remove(idx);
                 let _ = req.tx.blocking_send(Err("Voice clone failed".into()));
             }
             if batch.is_empty() { continue; }
-
-            // Rebuild prompts without failed entries
-            let prompts: Vec<Option<std::sync::Arc<qwen3_tts::VoiceClonePrompt>>> = {
-                let mut kept = Vec::new();
-                for (idx, p) in prompts.into_iter().enumerate() {
-                    if !failed.contains(&idx) { kept.push(p); }
-                }
-                kept
-            };
 
             // Streaming with voice_prompts uses speaker embedding (x_vector style)
             // — no ref_text replay frames to skip. skip_samples = 0 for all.
@@ -481,12 +584,14 @@ async fn main() -> Result<()> {
         tx, stream_tx, semaphore: Arc::new(Semaphore::new(max_inflight)), max_inflight, max_batch,
         metrics: Arc::new(Metrics::new()),
         prompt_cache,
+        model: model.clone(),
     });
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/audio/speech", post(synthesize))
+        .route("/v1/embeddings/preload", post(preload_embedding))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -552,6 +657,7 @@ mod tests {
             ref_text: Some("ref".into()),
             temperature: None,
             stream: None,
+            voice_id: None,
         };
         let result = decode_ref_audio(&req);
         assert!(result.is_ok());
@@ -573,6 +679,7 @@ mod tests {
             ref_text: None,
             temperature: None,
             stream: None,
+            voice_id: None,
         };
         assert!(decode_ref_audio(&req).is_err());
     }
@@ -586,6 +693,7 @@ mod tests {
             ref_text: None,
             temperature: None,
             stream: None,
+            voice_id: None,
         };
         assert!(decode_ref_audio(&req).unwrap().is_none());
     }
