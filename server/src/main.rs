@@ -457,6 +457,21 @@ async fn main() -> Result<()> {
     let model = Arc::new(qwen3_tts::Qwen3TTS::from_pretrained(&model_dir, device)?);
     info!("Shared model loaded");
 
+    // Warmup: dummy forward pass through speaker encoder + speech encoder + transformer
+    // Forces CUDA kernel compilation and cache warming before first real request
+    {
+        let t0 = std::time::Instant::now();
+        let dummy_audio = qwen3_tts::AudioBuffer::new(vec![0.0f32; 24000], 24000); // 1s silence
+        if let Ok(prompt) = model.create_voice_clone_prompt(&dummy_audio, Some("warmup")) {
+            // Run a short synthesis to warm transformer + vocoder
+            let _ = model.synthesize_voice_clone(
+                "warmup", &prompt, qwen3_tts::Language::English,
+                Some(qwen3_tts::SynthesisOptions { max_length: 5, ..Default::default() }),
+            );
+        }
+        info!(elapsed_ms = t0.elapsed().as_millis(), "Warmup complete");
+    }
+
     let prompt_cache: batch::PromptCache = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let tx = BatchEngine::start(model.clone(), BatchEngineConfig { max_batch_size: max_batch, max_wait_ms }, prompt_cache.clone());
     let stream_tx = start_streaming_worker(model.clone(), prompt_cache.clone());
