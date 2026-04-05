@@ -278,17 +278,9 @@ Without flash-attn (simpler, slightly slower):
 cargo build --release --features cuda
 ```
 
-### Cross-compilation on Modal
-
-For building on H100 targeting L4 (sm_89):
-
-```bash
-modal run modal_compile.py          # compile on H100
-```
-
 ## Benchmarking
 
-Scripts in `scripts/` for benchmarking against a running server (no Modal needed):
+Scripts in `scripts/` for benchmarking against a running server:
 
 ```bash
 # Batch throughput + concurrent latency (1/2/4/8/16 requests)
@@ -305,14 +297,6 @@ python3 scripts/bench_streaming.py --url http://localhost:8090 --trials 5
 
 # Custom concurrency levels
 python3 scripts/bench_server.py --concurrency 1,4,8,16,32
-```
-
-Remote benchmarks on Modal (optional, for profiling on cloud GPUs):
-
-```bash
-modal run modal_flash_batch.py      # batch throughput on L4
-modal run modal_profile.py          # per-phase profiling on L4
-modal run modal_test.py             # unit tests on L4
 ```
 
 ## Architecture
