@@ -1618,30 +1618,44 @@ impl Qwen3TTS {
         let mut prev_frames: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
         let mut prev_tail: Vec<Vec<f32>> = (0..n).map(|_| Vec::new()).collect();
 
+        // Early stopping: detect token repetition (model stuck in loop)
+        let rep_threshold: usize = 5; // stop after 5 consecutive identical tokens
+        let mut rep_counts: Vec<usize> = vec![0; n];
+        let mut prev_ids: Vec<u32> = vec![u32::MAX; n];
+
         // Phase 3: Batched generation with streaming decode
         for frame_idx in 0..gen_config.max_new_tokens {
             for i in 0..n {
                 if !done[i] {
-                    if let Some(eos_id) = gen_config.eos_token_id {
-                        if semantic_ids[i] == eos_id {
-                            done[i] = true;
-                            // Flush buffered frames immediately on EOS (with context)
-                            if !frame_buffers[i].is_empty() {
-                                let ctx = &prev_frames[i];
-                                let mut decode_input = ctx.clone();
-                                decode_input.extend(frame_buffers[i].drain(..));
-                                let ctx_samples = ctx.len() * samples_per_frame;
-                                if let Ok(audio) = self.decode_codes(&decode_input) {
-                                    if ctx_samples < audio.samples.len() {
-                                        let mut chunk = audio.samples[ctx_samples..].to_vec();
-                                        let tail = &prev_tail[i];
-                                        let fade = tail.len().min(chunk.len()).min(crossfade_len);
-                                        for j in 0..fade {
-                                            let t = (j + 1) as f32 / (fade + 1) as f32;
-                                            chunk[j] = tail[tail.len() - fade + j] * (1.0 - t) + chunk[j] * t;
-                                        }
-                                        let _ = senders[i].send(AudioBuffer::new(chunk, audio.sample_rate));
+                    // EOS detection
+                    let is_eos = gen_config.eos_token_id.map_or(false, |eos| semantic_ids[i] == eos);
+                    // Repetition detection
+                    if semantic_ids[i] == prev_ids[i] {
+                        rep_counts[i] += 1;
+                    } else {
+                        rep_counts[i] = 0;
+                        prev_ids[i] = semantic_ids[i];
+                    }
+                    let is_stuck = rep_counts[i] >= rep_threshold;
+
+                    if is_eos || is_stuck {
+                        done[i] = true;
+                        // Flush buffered frames immediately (with context)
+                        if !frame_buffers[i].is_empty() {
+                            let ctx = &prev_frames[i];
+                            let mut decode_input = ctx.clone();
+                            decode_input.extend(frame_buffers[i].drain(..));
+                            let ctx_samples = ctx.len() * samples_per_frame;
+                            if let Ok(audio) = self.decode_codes(&decode_input) {
+                                if ctx_samples < audio.samples.len() {
+                                    let mut chunk = audio.samples[ctx_samples..].to_vec();
+                                    let tail = &prev_tail[i];
+                                    let fade = tail.len().min(chunk.len()).min(crossfade_len);
+                                    for j in 0..fade {
+                                        let t = (j + 1) as f32 / (fade + 1) as f32;
+                                        chunk[j] = tail[tail.len() - fade + j] * (1.0 - t) + chunk[j] * t;
                                     }
+                                    let _ = senders[i].send(AudioBuffer::new(chunk, audio.sample_rate));
                                 }
                             }
                         }
