@@ -1,0 +1,16 @@
+[workspace]
+members = ["server", "vendor/qwen3-tts-rs"]
+resolver = "2"
+
+[workspace.dependencies]
+qwen3-tts = { path = "vendor/qwen3-tts-rs" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = false
