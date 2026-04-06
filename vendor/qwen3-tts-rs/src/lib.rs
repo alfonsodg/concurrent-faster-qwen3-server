@@ -1613,7 +1613,9 @@ impl Qwen3TTS {
         // trim context audio. O(1) per chunk, seamless boundaries.
         let vocoder_context_frames: usize = 8;
         let samples_per_frame: usize = 24000 / 12; // 2000
+        let crossfade_len: usize = 48; // ~2ms at 24kHz — eliminates boundary clicks
         let mut prev_frames: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
+        let mut prev_tail: Vec<Vec<f32>> = (0..n).map(|_| Vec::new()).collect();
 
         // Phase 3: Batched generation with streaming decode
         for frame_idx in 0..gen_config.max_new_tokens {
@@ -1629,10 +1631,16 @@ impl Qwen3TTS {
                                 decode_input.extend(frame_buffers[i].drain(..));
                                 let ctx_samples = ctx.len() * samples_per_frame;
                                 if let Ok(audio) = self.decode_codes(&decode_input) {
-                                    let trimmed = if ctx_samples < audio.samples.len() {
-                                        AudioBuffer::new(audio.samples[ctx_samples..].to_vec(), audio.sample_rate)
-                                    } else { audio };
-                                    let _ = senders[i].send(trimmed);
+                                    if ctx_samples < audio.samples.len() {
+                                        let mut chunk = audio.samples[ctx_samples..].to_vec();
+                                        let tail = &prev_tail[i];
+                                        let fade = tail.len().min(chunk.len()).min(crossfade_len);
+                                        for j in 0..fade {
+                                            let t = (j + 1) as f32 / (fade + 1) as f32;
+                                            chunk[j] = tail[tail.len() - fade + j] * (1.0 - t) + chunk[j] * t;
+                                        }
+                                        let _ = senders[i].send(AudioBuffer::new(chunk, audio.sample_rate));
+                                    }
                                 }
                             }
                         }
@@ -1714,10 +1722,23 @@ impl Qwen3TTS {
                     let ctx_samples = ctx.len() * samples_per_frame;
 
                     if let Ok(audio) = self.decode_codes(&decode_input) {
-                        let trimmed = if ctx_samples < audio.samples.len() {
-                            AudioBuffer::new(audio.samples[ctx_samples..].to_vec(), audio.sample_rate)
-                        } else { audio };
-                        let _ = senders[i].send(trimmed);
+                        if ctx_samples < audio.samples.len() {
+                            let mut chunk = audio.samples[ctx_samples..].to_vec();
+                            // Cross-fade with previous chunk tail to eliminate boundary click
+                            let tail = &prev_tail[i];
+                            let fade = tail.len().min(chunk.len()).min(crossfade_len);
+                            for j in 0..fade {
+                                let t = (j + 1) as f32 / (fade + 1) as f32;
+                                chunk[j] = tail[tail.len() - fade + j] * (1.0 - t) + chunk[j] * t;
+                            }
+                            if chunk.len() >= crossfade_len {
+                                prev_tail[i] = chunk[chunk.len() - crossfade_len..].to_vec();
+                                chunk.truncate(chunk.len() - crossfade_len);
+                            }
+                            if !chunk.is_empty() {
+                                let _ = senders[i].send(AudioBuffer::new(chunk, audio.sample_rate));
+                            }
+                        }
                     }
                     // Keep last N frames as context for next chunk
                     prev_frames[i].extend(frame_buffers[i].drain(..));
@@ -1737,10 +1758,16 @@ impl Qwen3TTS {
                 decode_input.extend(frame_buffers[i].iter().cloned());
                 let ctx_samples = ctx.len() * samples_per_frame;
                 if let Ok(audio) = self.decode_codes(&decode_input) {
-                    let trimmed = if ctx_samples < audio.samples.len() {
-                        AudioBuffer::new(audio.samples[ctx_samples..].to_vec(), audio.sample_rate)
-                    } else { audio };
-                    let _ = senders[i].send(trimmed);
+                    if ctx_samples < audio.samples.len() {
+                        let mut chunk = audio.samples[ctx_samples..].to_vec();
+                        let tail = &prev_tail[i];
+                        let fade = tail.len().min(chunk.len()).min(crossfade_len);
+                        for j in 0..fade {
+                            let t = (j + 1) as f32 / (fade + 1) as f32;
+                            chunk[j] = tail[tail.len() - fade + j] * (1.0 - t) + chunk[j] * t;
+                        }
+                        let _ = senders[i].send(AudioBuffer::new(chunk, audio.sample_rate));
+                    }
                 }
             }
         }
