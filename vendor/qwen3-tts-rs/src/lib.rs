@@ -1609,11 +1609,11 @@ impl Qwen3TTS {
         // Pre-allocate zero tensor for done sequences
         let zero_input = Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?;
 
-        // Context buffers for vocoder: accumulate ALL frames, decode full sequence each chunk,
-        // send only new samples. Guarantees perfect continuity (no chunk boundary gaps).
+        // Fixed-window vocoder context: decode chunk with last N context frames prepended,
+        // trim context audio. O(1) per chunk, seamless boundaries.
+        let vocoder_context_frames: usize = 8;
         let samples_per_frame: usize = 24000 / 12; // 2000
-        let mut all_frames: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
-        let mut sent_samples: Vec<usize> = vec![0; n];
+        let mut prev_frames: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
 
         // Phase 3: Batched generation with streaming decode
         for frame_idx in 0..gen_config.max_new_tokens {
@@ -1622,12 +1622,18 @@ impl Qwen3TTS {
                     if let Some(eos_id) = gen_config.eos_token_id {
                         if semantic_ids[i] == eos_id {
                             done[i] = true;
-                            // Flush buffered frames immediately on EOS
+                            // Flush buffered frames immediately on EOS (with context)
                             if !frame_buffers[i].is_empty() {
-                                if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
-                                    let _ = senders[i].send(audio);
+                                let ctx = &prev_frames[i];
+                                let mut decode_input = ctx.clone();
+                                decode_input.extend(frame_buffers[i].drain(..));
+                                let ctx_samples = ctx.len() * samples_per_frame;
+                                if let Ok(audio) = self.decode_codes(&decode_input) {
+                                    let trimmed = if ctx_samples < audio.samples.len() {
+                                        AudioBuffer::new(audio.samples[ctx_samples..].to_vec(), audio.sample_rate)
+                                    } else { audio };
+                                    let _ = senders[i].send(trimmed);
                                 }
-                                frame_buffers[i].clear();
                             }
                         }
                     }
@@ -1698,18 +1704,26 @@ impl Qwen3TTS {
                 Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
             }
 
-            // Decode and send chunks every chunk_frames (full-context decode for seamless audio)
+            // Decode and send chunks with fixed vocoder context window
             if (frame_idx + 1) % chunk_frames == 0 {
                 for i in 0..n {
                     if done[i] || frame_buffers[i].is_empty() { continue; }
-                    all_frames[i].extend(frame_buffers[i].drain(..));
-                    if let Ok(audio) = self.decode_codes(&all_frames[i]) {
-                        let new_start = sent_samples[i];
-                        if new_start < audio.samples.len() {
-                            let new_audio = AudioBuffer::new(audio.samples[new_start..].to_vec(), audio.sample_rate);
-                            let _ = senders[i].send(new_audio);
-                            sent_samples[i] = audio.samples.len();
-                        }
+                    let ctx = &prev_frames[i];
+                    let mut decode_input = ctx.clone();
+                    decode_input.extend(frame_buffers[i].iter().cloned());
+                    let ctx_samples = ctx.len() * samples_per_frame;
+
+                    if let Ok(audio) = self.decode_codes(&decode_input) {
+                        let trimmed = if ctx_samples < audio.samples.len() {
+                            AudioBuffer::new(audio.samples[ctx_samples..].to_vec(), audio.sample_rate)
+                        } else { audio };
+                        let _ = senders[i].send(trimmed);
+                    }
+                    // Keep last N frames as context for next chunk
+                    prev_frames[i].extend(frame_buffers[i].drain(..));
+                    let total = prev_frames[i].len();
+                    if total > vocoder_context_frames {
+                        prev_frames[i] = prev_frames[i][total - vocoder_context_frames..].to_vec();
                     }
                 }
             }
@@ -1718,13 +1732,15 @@ impl Qwen3TTS {
         // Flush remaining frames
         for i in 0..n {
             if !done[i] && !frame_buffers[i].is_empty() {
-                all_frames[i].extend(frame_buffers[i].drain(..));
-                if let Ok(audio) = self.decode_codes(&all_frames[i]) {
-                    let new_start = sent_samples[i];
-                    if new_start < audio.samples.len() {
-                        let new_audio = AudioBuffer::new(audio.samples[new_start..].to_vec(), audio.sample_rate);
-                        let _ = senders[i].send(new_audio);
-                    }
+                let ctx = &prev_frames[i];
+                let mut decode_input = ctx.clone();
+                decode_input.extend(frame_buffers[i].iter().cloned());
+                let ctx_samples = ctx.len() * samples_per_frame;
+                if let Ok(audio) = self.decode_codes(&decode_input) {
+                    let trimmed = if ctx_samples < audio.samples.len() {
+                        AudioBuffer::new(audio.samples[ctx_samples..].to_vec(), audio.sample_rate)
+                    } else { audio };
+                    let _ = senders[i].send(trimmed);
                 }
             }
         }
