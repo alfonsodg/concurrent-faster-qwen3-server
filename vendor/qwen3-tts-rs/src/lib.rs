@@ -1609,6 +1609,12 @@ impl Qwen3TTS {
         // Pre-allocate zero tensor for done sequences
         let zero_input = Tensor::zeros((1, 1, hidden_size), self.compute_dtype, &self.device)?;
 
+        // Context buffers for vocoder: accumulate ALL frames, decode full sequence each chunk,
+        // send only new samples. Guarantees perfect continuity (no chunk boundary gaps).
+        let samples_per_frame: usize = 24000 / 12; // 2000
+        let mut all_frames: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
+        let mut sent_samples: Vec<usize> = vec![0; n];
+
         // Phase 3: Batched generation with streaming decode
         for frame_idx in 0..gen_config.max_new_tokens {
             for i in 0..n {
@@ -1692,23 +1698,33 @@ impl Qwen3TTS {
                 Self::update_penalty_mask(&mut penalty_masks[i], semantic_ids[i], codec_tokens::CODEC_VOCAB_SIZE)?;
             }
 
-            // Decode and send chunks every chunk_frames
+            // Decode and send chunks every chunk_frames (full-context decode for seamless audio)
             if (frame_idx + 1) % chunk_frames == 0 {
                 for i in 0..n {
                     if done[i] || frame_buffers[i].is_empty() { continue; }
-                    if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
-                        let _ = senders[i].send(audio);
+                    all_frames[i].extend(frame_buffers[i].drain(..));
+                    if let Ok(audio) = self.decode_codes(&all_frames[i]) {
+                        let new_start = sent_samples[i];
+                        if new_start < audio.samples.len() {
+                            let new_audio = AudioBuffer::new(audio.samples[new_start..].to_vec(), audio.sample_rate);
+                            let _ = senders[i].send(new_audio);
+                            sent_samples[i] = audio.samples.len();
+                        }
                     }
-                    frame_buffers[i].clear();
                 }
             }
         }
 
-        // Flush remaining frames (only for sequences that haven't hit EOS mid-chunk)
+        // Flush remaining frames
         for i in 0..n {
             if !done[i] && !frame_buffers[i].is_empty() {
-                if let Ok(audio) = self.decode_codes(&frame_buffers[i]) {
-                    let _ = senders[i].send(audio);
+                all_frames[i].extend(frame_buffers[i].drain(..));
+                if let Ok(audio) = self.decode_codes(&all_frames[i]) {
+                    let new_start = sent_samples[i];
+                    if new_start < audio.samples.len() {
+                        let new_audio = AudioBuffer::new(audio.samples[new_start..].to_vec(), audio.sample_rate);
+                        let _ = senders[i].send(new_audio);
+                    }
                 }
             }
         }

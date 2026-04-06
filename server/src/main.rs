@@ -364,7 +364,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
     let stream_max_batch: usize = std::env::var("STREAM_MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let stream_wait_ms: u64 = std::env::var("STREAM_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
     let stream_poll_ms: u64 = std::env::var("STREAM_POLL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-    let stream_chunk_frames: usize = std::env::var("STREAM_CHUNK_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let stream_chunk_frames: usize = std::env::var("STREAM_CHUNK_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
 
     let (tx, rx) = mpsc::channel::<StreamingRequest>(16);
     let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
@@ -464,6 +464,7 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                     std::thread::spawn(move || {
                         let mut remaining_skip = skip;
                         let mut header_sent = false;
+                        let mut speech_chunks: usize = 0;
                         while let Ok(audio) = rx.recv() {
                             let samples = &audio.samples;
                             // Skip ref_audio portion for ICL
@@ -483,7 +484,9 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                             }
                             // Stop sending on silence (model past EOS)
                             let rms: f32 = (samples.iter().map(|s| s*s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
-                            if header_sent && rms < 0.003 { break; }
+                            // Stop on silence only after speech has started
+                            if speech_chunks > 2 && rms < 0.003 { break; }
+                            if rms > 0.01 { speech_chunks += 1; }
                             if !header_sent {
                                 if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { break; }
                                 header_sent = true;
