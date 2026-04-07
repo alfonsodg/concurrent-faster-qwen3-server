@@ -21,15 +21,15 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 | 8 | 11.49x RT | 0.4s | 11 | ~4GB |
 | 16 | 16.59x RT | 0.3s | 16 | ~5GB |
 
-Streaming TTFA: ~330ms (with voice cloning, cached). In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
+Streaming TTFA: ~325ms (with voice cloning, preloaded). In a real call center scenario (conversational duty cycle ~10%), a single L4 can handle ~60-80 simultaneous calls.
 
 ### Streaming with Voice Clone (L4, 0.6B)
 
 | Phrase | Words | TTFA | Total | Audio | RTF |
 |--------|-------|------|-------|-------|-----|
-| Short | 6 | 323ms | 4.56s | 3.56s | 1.28x |
-| Medium | 17 | 322ms | 8.92s | 4.70s | 1.90x |
-| Long | 27 | 322ms | 11.01s | 5.33s | 2.06x |
+| Short | 6 | 331ms | 4.88s | 4.06s | 1.20x |
+| Medium | 17 | 326ms | 6.25s | 4.96s | 1.26x |
+| Long | 27 | 321ms | 7.03s | 5.63s | 1.25x |
 
 ### vs other TTS models (L4)
 
@@ -111,6 +111,7 @@ Synthesize speech from text. Supports standard synthesis, voice cloning, and str
 | `stream` | bool | no | `false` | Enable chunked streaming response |
 | `ref_audio` | string | no | — | Base64-encoded WAV for voice cloning |
 | `ref_text` | string | no | — | Transcript of ref_audio (enables ICL mode for better quality) |
+| `voice_id` | string | no | — | Preloaded voice ID (use `/v1/embeddings/preload` first) |
 
 #### Response
 
@@ -229,9 +230,28 @@ Two modes available:
 | Scenario | TTFA |
 |----------|------|
 | Streaming, no voice cloning | ~322ms |
-| Streaming + voice cloning (preloaded voice_id) | ~330ms |
+| Streaming + voice cloning (preloaded voice_id) | ~325ms |
 | Streaming + voice cloning (first call, cold) | ~350ms |
 | Non-streaming + voice cloning (cached) | ~2800ms |
+
+The server warms up CUDA kernels at startup (~600ms). First real request has no compilation penalty.
+
+### Voice ID Preload
+
+Pre-encode speaker embeddings to eliminate encoder latency from the synthesis path:
+
+```bash
+REF_B64=$(base64 -w0 reference.wav)
+# Preload
+curl -X POST http://localhost:8090/v1/embeddings/preload \
+  -H "Content-Type: application/json" \
+  -d "{\"ref_audio\": \"$REF_B64\", \"voice_id\": \"my-voice\"}"
+# Synthesize with preloaded voice
+curl -X POST http://localhost:8090/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Buenos días", "language": "spanish", "stream": true, "voice_id": "my-voice"}' \
+  --output stream.wav
+```
 
 The server warms up CUDA kernels at startup (speaker encoder + transformer + vocoder). First real request has no compilation penalty.
 
