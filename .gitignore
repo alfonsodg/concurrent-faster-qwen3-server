@@ -49,3 +49,7 @@ todo
 # AI agents — never track
 AGENTS.md
 .kiro/
+
+# Vendor test assets
+vendor/qwen3-tts-rs/assets/audio/
+vendor/qwen3-tts-rs/examples/data/
