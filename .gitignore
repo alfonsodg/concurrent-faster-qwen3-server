@@ -42,3 +42,10 @@ qwen3-tts-server-v*
 # Environment
 .env
 qwen3-tts-server-test
+
+# Kiro conversation
+todo
+
+# AI agents — never track
+AGENTS.md
+.kiro/
