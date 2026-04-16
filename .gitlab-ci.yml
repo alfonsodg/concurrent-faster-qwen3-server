@@ -1,0 +1,120 @@
+include:
+  - local: .gitlab-ci-sync.yml
+
+stages:
+  - check
+  - build
+  - deploy
+  - sync
+  - security
+
+variables:
+  IMAGE_TAG: $CI_REG/$CI_PROJECT_PATH:$CI_COMMIT_TAG
+  DOCKER_DRIVER: overlay2
+
+# === PYTHON CHECKS (uv o pip) ===
+.python_check:
+  image: python:3.13
+  before_script:
+    - |
+      if [ -f "pyproject.toml" ]; then
+        pip install uv && uv sync
+      elif [ -f "requirements.txt" ]; then
+        pip install -r requirements.txt
+      fi
+  rules:
+    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+      when: never
+    - exists:
+        - pyproject.toml
+        - requirements.txt
+
+pylint:
+  extends: .python_check
+  stage: check
+  allow_failure: true
+  script:
+    - pip install pylint
+    - pylint --recursive=y --ignore venv,.venv,test,test.py --disable=C0103,E1133 --ignored-modules=psycopg2.errors .
+
+ruff:
+  extends: .python_check
+  stage: check
+  allow_failure: true
+  script:
+    - |
+      if [ -f "pyproject.toml" ]; then
+        uv run ruff check .
+      else
+        pip install ruff && ruff check .
+      fi
+
+# === NODE CHECKS ===
+eslint:
+  stage: check
+  image: node:24-alpine
+  allow_failure: true
+  script:
+    - npm ci
+    - npx eslint .
+  rules:
+    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+      when: never
+    - exists:
+        - package.json
+
+# === GO CHECKS ===
+go-lint:
+  stage: check
+  image: golang:1.24-alpine
+  allow_failure: true
+  script:
+    - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+    - golangci-lint run
+  rules:
+    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+      when: never
+    - exists:
+        - go.mod
+
+# === RUST CHECKS ===
+rust-lint:
+  stage: check
+  image: rust:1.84-alpine
+  before_script:
+    - apk add --no-cache musl-dev
+  script:
+    - rustup component add clippy
+    - cargo clippy -- -D warnings
+  rules:
+    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+      when: never
+    - exists:
+        - Cargo.toml
+
+# === BUILD ===
+build-container:
+  stage: build
+  image: docker:24
+  script:
+    - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
+    - docker build -t $IMAGE_TAG -f Dockerfile .
+    - docker push $IMAGE_TAG
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
+  retry:
+    max: 2
+    when: runner_system_failure
+
+# === DEPLOY ===
+deploy-production:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$REMOTE_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && ssh-keyscan -H "$REMOTE_IP" >> ~/.ssh/known_hosts
+    - ssh $REMOTE_USER@$REMOTE_IP "docker service update --update-parallelism 1 --update-delay 10s --update-failure-action=rollback --image $IMAGE_TAG $REMOTE_SERVICE"
+  rules:
+    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
