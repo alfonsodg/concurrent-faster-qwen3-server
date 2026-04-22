@@ -1676,7 +1676,7 @@ impl Qwen3TTS {
         let mut prev_tail: Vec<Vec<f32>> = (0..n).map(|_| Vec::new()).collect();
 
         // Early stopping: detect token repetition (model stuck in loop)
-        let rep_threshold: usize = 3; // stop after 3 consecutive identical tokens
+        let rep_threshold: usize = 6; // stop after 6 consecutive identical tokens
         let mut rep_counts: Vec<usize> = vec![0; n];
         let mut prev_ids: Vec<u32> = vec![u32::MAX; n];
 
