@@ -204,3 +204,107 @@ preload_voice("maria.wav", "agent-maria")
 - **Parallel batch requests** — the server batches up to 12 concurrent requests into one GPU pass
 - **Temperature 0.7** — good balance of naturalness and consistency. Use 0.5 for more robotic but predictable output
 - **Keep text under 50 words** — longer texts generate more frames and take longer. Split into sentences for streaming
+
+## 9. Voice Clone: Sentence Splitting (Critical)
+
+With voice cloning, the model generates fewer frames than without clone. Long texts (40+ words) get truncated — the audio cuts off before the text finishes. This is model behavior, not a server bug.
+
+**The fix: split text into sentences before calling the TTS server.**
+
+Each sentence should be under 20 words. Generate each one separately, then concatenate.
+
+### Python example
+
+```python
+import re, wave, io
+
+def split_sentences(text):
+    """Split text into sentences at punctuation boundaries."""
+    parts = re.split(r'(?<=[.!?;:])\s+', text.strip())
+    # Further split long sentences at commas
+    result = []
+    for part in parts:
+        if len(part.split()) > 20:
+            sub = re.split(r'(?<=,)\s+', part)
+            result.extend(sub)
+        else:
+            result.append(part)
+    return [s.strip() for s in result if s.strip()]
+
+def synthesize_long_text(text, voice_id, server="http://localhost:8090"):
+    """Generate audio for long text with voice clone using sentence splitting."""
+    import json
+    from urllib.request import Request, urlopen
+
+    sentences = split_sentences(text)
+    all_pcm = bytearray()
+
+    for sentence in sentences:
+        body = json.dumps({
+            "text": sentence,
+            "language": "spanish",
+            "stream": True,
+            "voice_id": voice_id,
+        }).encode()
+        req = Request(
+            f"{server}/v1/audio/speech",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urlopen(req, timeout=60)
+        resp.read(44)  # skip WAV header
+        all_pcm.extend(resp.read())
+
+    # Save concatenated audio
+    return bytes(all_pcm)
+
+# Usage
+pcm = synthesize_long_text(
+    "Le informo que hemos recibido su solicitud de crédito. "
+    "El departamento de análisis la revisará en un plazo de tres a cinco días hábiles. "
+    "¿Desea que le enviemos una notificación por correo electrónico?",
+    voice_id="agent-maria",
+)
+save_wav(pcm, "long_text.wav")
+```
+
+### Bash example
+
+```bash
+#!/bin/bash
+SERVER="http://localhost:8090"
+VOICE="agent-maria"
+OUTPUT="full_audio.wav"
+
+# Split at sentence boundaries, generate each, concatenate
+SENTENCES=(
+  "Le informo que hemos recibido su solicitud de crédito."
+  "El departamento de análisis la revisará en un plazo de tres a cinco días hábiles."
+  "¿Desea que le enviemos una notificación por correo electrónico?"
+)
+
+# Generate each sentence
+for i in "${!SENTENCES[@]}"; do
+  curl -s -X POST "$SERVER/v1/audio/speech" \
+    -H "Content-Type: application/json" \
+    -d "{\"text\": \"${SENTENCES[$i]}\", \"language\": \"spanish\", \"stream\": true, \"voice_id\": \"$VOICE\"}" \
+    --output "/tmp/part_${i}.wav"
+done
+
+# Concatenate with sox
+sox /tmp/part_*.wav "$OUTPUT"
+rm /tmp/part_*.wav
+```
+
+### Why this happens
+
+The Qwen3-TTS model with voice clone (x_vector speaker embedding) changes the token distribution. The model tends to generate EOS or repetitive tokens earlier than without clone. Observed behavior:
+
+| Text length | Without clone | With clone |
+|-------------|--------------|------------|
+| Short (<15 words) | Full audio | Full audio |
+| Medium (15-25 words) | Full audio | Full audio |
+| Long (25-40 words) | Full audio | May truncate |
+| Very long (40+ words) | Full audio | Truncates ~50% |
+
+The server's `adaptive_max_length` and `rep_threshold` help but cannot fully compensate for the model's behavior. Sentence splitting is the reliable solution.
