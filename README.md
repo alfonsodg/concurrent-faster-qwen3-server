@@ -71,7 +71,7 @@ Full comparison with 29+ models: [docs/TTS_STT_EVALUATION.md](docs/TTS_STT_EVALU
 ```bash
 # From GitHub releases
 curl -L -o qwen3-tts-server \
-  "https://github.com/alfonsodg/concurrent-faster-qwen3-server/releases/download/v0.7.5/qwen3-tts-server-v0.7.5-linux-x86_64"
+  "https://github.com/alfonsodg/concurrent-faster-qwen3-server/releases/download/v0.7.6/qwen3-tts-server-v0.7.6-linux-x86_64"
 chmod +x qwen3-tts-server
 ```
 
