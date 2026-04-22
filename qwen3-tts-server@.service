@@ -1,0 +1,15 @@
+[Unit]
+Description=Qwen3-TTS Concurrent Server
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/qwen3-tts-server
+EnvironmentFile=-%h/qwen3-tts-server/.env
+ExecStart=%h/qwen3-tts-server/target/release/qwen3-tts-server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
