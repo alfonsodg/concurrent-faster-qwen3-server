@@ -12,6 +12,17 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 - Prometheus metrics: `/metrics` endpoint for monitoring
 - Low VRAM: 2.7GB idle, ~4GB during inference
 
+## Supported Models
+
+| Model | Params | VRAM | Best for |
+|-------|--------|------|----------|
+| [Qwen3-TTS-12Hz-0.6B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | 0.6B | 2.7GB | L4, T4, low VRAM |
+| [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | 1.7B | 5.2GB | L40S, A100 — better quality, more reliable EOS with voice clone |
+
+Set `MODEL_DIR` to switch models. No recompilation needed.
+
+> **Full API usage guide with examples**: [docs/USAGE.md](docs/USAGE.md) — batch generation, streaming, voice cloning, Python integration, sentence splitting for long texts.
+
 ## Performance (NVIDIA L4, 23GB)
 
 | Batch | Throughput | Latency/req | Concurrent calls (real-time) | VRAM |
@@ -23,24 +34,22 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 
 Streaming TTFA: ~230ms (with voice cloning, preloaded on L40S). Batched vocoder decode enables 8 concurrent real-time streams per GPU.
 
-### Streaming Concurrent (L40S, 46GB)
+### Streaming Concurrent (L40S, 46GB, 1.7B)
 
 | CCU | TTFA | Throughput | Real-time streams |
 |-----|------|-----------|-------------------|
-| 1 | 227ms | 0.9x RT | ✅ |
-| 2 | 240ms | 2.4x RT | ✅ |
-| 4 | 250ms | 4.5x RT | ✅ |
-| 8 | 228ms | 7.5x RT | ✅ |
-| 12 | 2615ms | 6.2x RT | ⚠️ TTFA degrades |
+| 1 | 334ms | 1.7x RT | ✅ |
+| 2 | 355ms | 3.0x RT | ✅ |
+| 4 | 376ms | 5.1x RT | ✅ |
+| 8 | 420ms | 9.2x RT | ✅ |
+| 12 | 408ms | 11.8x RT | ✅ |
 
-### Streaming with Voice Clone (L40S, 0.6B)
+### Streaming with Voice Clone (L40S, 1.7B)
 
 | Phrase | Words | TTFA | Total | Audio | RTF |
 |--------|-------|------|-------|-------|-----|
-| Medium | 20 | 233ms | 5.12s | 6.31s | 0.81x |
-| Medium | 20 | 230ms | 4.98s | 6.31s | 0.79x |
-| Long | 42 | 231ms | 3.91s | 4.73s | 0.82x |
-| Long | 45 | 232ms | 6.90s | 9.00s | 0.77x |
+| Medium | 21 | 339ms | 5.16s | 8.31s | 0.62x |
+| Long | 45 | 337ms | 11.40s | 18.39s | 0.62x |
 
 ### vs other TTS models (L4 24GB)
 
