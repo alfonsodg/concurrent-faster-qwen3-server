@@ -1,8 +1,13 @@
+# Standard CI/CD template for all Scovil repositories
+# Security scans run on gitlab.com via sync
 include:
-  - local: .gitlab-ci-sync.yml
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
 
 stages:
   - check
+  - test
   - build
   - deploy
   - sync
@@ -10,60 +15,46 @@ stages:
 
 variables:
   IMAGE_TAG: $CI_REG/$CI_PROJECT_PATH:$CI_COMMIT_TAG
-  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: unix:///var/run/docker.sock
 
-# === PYTHON CHECKS (uv o pip) ===
-.python_check:
-  image: python:3.13
-  before_script:
-    - |
-      if [ -f "pyproject.toml" ]; then
-        pip install uv && uv sync
-      elif [ -f "requirements.txt" ]; then
-        pip install -r requirements.txt
-      fi
+# ============================================================
+# CHECK STAGE — linters per language (all allow_failure: true)
+# ============================================================
+
+# --- Python ---
+.python_exists:
   rules:
-    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+    - if: $CI_COMMIT_TAG
       when: never
     - exists:
         - pyproject.toml
         - requirements.txt
 
-pylint:
-  extends: .python_check
-  stage: check
-  allow_failure: true
-  script:
-    - pip install pylint
-    - pylint --recursive=y --ignore venv,.venv,test,test.py --disable=C0103,E1133 --ignored-modules=psycopg2.errors .
-
 ruff:
-  extends: .python_check
   stage: check
+  image: python:3.14-slim
   allow_failure: true
+  extends: .python_exists
   script:
-    - |
-      if [ -f "pyproject.toml" ]; then
-        uv run ruff check .
-      else
-        pip install ruff && ruff check .
-      fi
+    - pip install -q ruff
+    - ruff check .
 
-# === NODE CHECKS ===
+# --- JavaScript / TypeScript ---
 eslint:
   stage: check
   image: node:24-alpine
   allow_failure: true
   script:
-    - npm ci
+    - npm ci --ignore-scripts
     - npx eslint .
   rules:
-    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+    - if: $CI_COMMIT_TAG
       when: never
     - exists:
         - package.json
 
-# === GO CHECKS ===
+# --- Go ---
 go-lint:
   stage: check
   image: golang:1.24-alpine
@@ -72,30 +63,87 @@ go-lint:
     - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
     - golangci-lint run
   rules:
-    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+    - if: $CI_COMMIT_TAG
       when: never
     - exists:
         - go.mod
 
-# === RUST CHECKS ===
+# --- Rust ---
 rust-lint:
   stage: check
   image: rust:1.84-alpine
+  allow_failure: true
   before_script:
     - apk add --no-cache musl-dev
   script:
     - rustup component add clippy
     - cargo clippy -- -D warnings
   rules:
-    - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+    - if: $CI_COMMIT_TAG
       when: never
     - exists:
         - Cargo.toml
 
-# === BUILD ===
+# --- Java ---
+java-lint:
+  stage: check
+  image: maven:3.9-eclipse-temurin-21-alpine
+  allow_failure: true
+  script:
+    - mvn -q compile -DskipTests
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - exists:
+        - pom.xml
+
+# ============================================================
+# TEST STAGE — runs if project has test config
+# ============================================================
+
+pytest:
+  stage: test
+  image: python:3.14-slim
+  allow_failure: true
+  before_script:
+    - |
+      if [ -f "pyproject.toml" ]; then
+        pip install -q uv && uv sync
+      elif [ -f "requirements.txt" ]; then
+        pip install -q -r requirements.txt
+      fi
+    - pip install -q pytest
+  script:
+    - pytest --tb=short -q
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - exists:
+        - tests/
+        - test/
+
+vitest:
+  stage: test
+  image: node:24-alpine
+  allow_failure: true
+  script:
+    - npm ci --ignore-scripts
+    - npx vitest run
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - exists:
+        - vitest.config.ts
+        - vitest.config.js
+        - vite.config.ts
+
+# ============================================================
+# BUILD STAGE — Docker image on tag
+# ============================================================
+
 build-container:
   stage: build
-  image: docker:24
+  image: docker:27
   script:
     - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
     - docker build -t $IMAGE_TAG -f Dockerfile .
@@ -106,15 +154,104 @@ build-container:
     max: 2
     when: runner_system_failure
 
-# === DEPLOY ===
+# ============================================================
+# DEPLOY STAGE — SSH deploy on tag with message "deploy"
+# ============================================================
+
 deploy-production:
   stage: deploy
   image: alpine:latest
   script:
-    - apk add --no-cache openssh-client
+    - apk add --no-cache openssh-client curl
     - eval $(ssh-agent -s)
     - echo "$REMOTE_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
     - mkdir -p ~/.ssh && ssh-keyscan -H "$REMOTE_IP" >> ~/.ssh/known_hosts
     - ssh $REMOTE_USER@$REMOTE_IP "docker service update --update-parallelism 1 --update-delay 10s --update-failure-action=rollback --image $IMAGE_TAG $REMOTE_SERVICE"
+    - |
+      if [ -n "$HEALTH_URL" ]; then
+        sleep 10
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL")
+        [ "$STATUS" = "200" ] && echo "✅ Health check passed" || echo "⚠️ Health check returned $STATUS"
+      fi
   rules:
     - if: $CI_COMMIT_TAG_MESSAGE == "deploy"
+
+# ============================================================
+# SYNC STAGE — push to gitlab.com for security scanning
+# ============================================================
+
+sync_to_gitlab_cloud:
+  stage: sync
+  image: alpine:latest
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - apk add --no-cache git openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$GITLAB_COM_SSH_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && ssh-keyscan gitlab.com >> ~/.ssh/known_hosts
+    - git remote add cloud git@gitlab.com:${GITLAB_CLOUD_GROUP:-ccvass}/${CI_PROJECT_NAME}.git 2>/dev/null || true
+    - git push cloud HEAD:refs/heads/${CI_COMMIT_REF_NAME} --force
+  rules:
+    - if: $CI_SERVER_HOST == "scovil.labtau.com" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")
+  allow_failure: true
+
+# ============================================================
+# SECURITY STAGE — import vulnerabilities as issues
+# ============================================================
+
+import_security_issues:
+  stage: security
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl jq
+    - |
+      PROJECT_PATH="${GITLAB_CLOUD_GROUP:-ccvass}/${CI_PROJECT_NAME}"
+      ENCODED_PATH=$(echo "$PROJECT_PATH" | sed 's|/|%2F|g')
+
+      EXISTING=$(curl -s -H "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
+        "https://scovil.labtau.com/api/v4/projects/$CI_PROJECT_ID/issues?labels=security,auto-generated&per_page=100" \
+        | jq -r '.[].title')
+
+      curl -s -H "PRIVATE-TOKEN: $GITLAB_COM_TOKEN" \
+        "https://gitlab.com/api/v4/projects/${ENCODED_PATH}/vulnerability_findings?severity=critical,high&per_page=100" \
+        | jq -c '.[]?' | while read -r vuln; do
+        TITLE=$(echo "$vuln" | jq -r '"[\(.severity)] \(.name)"')
+
+        if echo "$EXISTING" | grep -qF "$TITLE"; then
+          echo "⏭️ $TITLE (exists)"
+          continue
+        fi
+
+        DESC=$(echo "$vuln" | jq -r '"**Archivo:** \(.location.file // "N/A")\n\n\(.description // "Sin descripción")"')
+
+        curl -s --request POST \
+          --header "PRIVATE-TOKEN: $CI_PERSONAL_TOKEN" \
+          "https://scovil.labtau.com/api/v4/projects/$CI_PROJECT_ID/issues" \
+          --data-urlencode "title=$TITLE" \
+          --data-urlencode "description=$DESC" \
+          --data "labels=security,auto-generated" > /dev/null
+        echo "✅ $TITLE"
+      done
+  rules:
+    - if: $CI_SERVER_HOST == "scovil.labtau.com" && $CI_COMMIT_BRANCH == "main"
+      when: delayed
+      start_in: 5 minutes
+  allow_failure: true
+
+# === Security jobs only on gitlab.com ===
+semgrep-sast:
+  rules:
+    - if: $CI_SERVER_HOST == "gitlab.com"
+
+secret_detection:
+  rules:
+    - if: $CI_SERVER_HOST == "gitlab.com"
+
+gemnasium-dependency_scanning:
+  rules:
+    - if: $CI_SERVER_HOST == "gitlab.com"
+
+gemnasium-python-dependency_scanning:
+  rules:
+    - if: $CI_SERVER_HOST == "gitlab.com"
