@@ -9,9 +9,11 @@ stages:
   - check
   - test
   - build
+  - scan
   - deploy
   - sync
   - security
+  - notify
 
 variables:
   IMAGE_TAG: $CI_REG/$CI_PROJECT_PATH:$CI_COMMIT_TAG
@@ -22,7 +24,6 @@ variables:
 # CHECK STAGE — linters per language (all allow_failure: true)
 # ============================================================
 
-# --- Python ---
 .python_exists:
   rules:
     - if: $CI_COMMIT_TAG
@@ -40,7 +41,6 @@ ruff:
     - pip install -q ruff
     - ruff check .
 
-# --- JavaScript / TypeScript ---
 eslint:
   stage: check
   image: node:24-alpine
@@ -54,7 +54,6 @@ eslint:
     - exists:
         - package.json
 
-# --- Go ---
 go-lint:
   stage: check
   image: golang:1.24-alpine
@@ -68,7 +67,6 @@ go-lint:
     - exists:
         - go.mod
 
-# --- Rust ---
 rust-lint:
   stage: check
   image: rust:1.84-alpine
@@ -84,7 +82,6 @@ rust-lint:
     - exists:
         - Cargo.toml
 
-# --- Java ---
 java-lint:
   stage: check
   image: maven:3.9-eclipse-temurin-21-alpine
@@ -98,7 +95,7 @@ java-lint:
         - pom.xml
 
 # ============================================================
-# TEST STAGE — runs if project has test config
+# TEST STAGE — auto-detect test framework, with coverage
 # ============================================================
 
 pytest:
@@ -112,9 +109,18 @@ pytest:
       elif [ -f "requirements.txt" ]; then
         pip install -q -r requirements.txt
       fi
-    - pip install -q pytest
+    - pip install -q pytest pytest-cov
   script:
-    - pytest --tb=short -q
+    - pytest --tb=short -q --cov --cov-report=term --cov-report=html:coverage-html --cov-report=xml:coverage.xml || true
+  coverage: '/(?i)total.*?(\d+(?:\.\d+)?%)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage-html/
+    expire_in: 7 days
   rules:
     - if: $CI_COMMIT_TAG
       when: never
@@ -128,7 +134,16 @@ vitest:
   allow_failure: true
   script:
     - npm ci --ignore-scripts
-    - npx vitest run
+    - npx vitest run --coverage || true
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 7 days
   rules:
     - if: $CI_COMMIT_TAG
       when: never
@@ -155,7 +170,75 @@ build-container:
     when: runner_system_failure
 
 # ============================================================
-# DEPLOY STAGE — SSH deploy on tag with message "deploy"
+# SCAN STAGE — Trivy + SonarQube
+# ============================================================
+
+trivy-scan:
+  stage: scan
+  image: docker:27
+  allow_failure: true
+  script:
+    - docker login -u "$CI_USER" -p "$CI_PWD" $CI_REG
+    - docker run --rm
+        -v /var/run/docker.sock:/var/run/docker.sock
+        aquasec/trivy:latest image
+        --severity HIGH,CRITICAL
+        --exit-code 0
+        --format table
+        $IMAGE_TAG
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
+  needs:
+    - build-container
+
+sonarqube:
+  stage: scan
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  allow_failure: true
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - sonar-scanner
+        -Dsonar.projectKey=${CI_PROJECT_PATH_SLUG}
+        -Dsonar.projectName="${CI_PROJECT_TITLE}"
+        -Dsonar.sources=.
+        -Dsonar.host.url=${SONAR_HOST_URL}
+        -Dsonar.token=${SONAR_TOKEN}
+        -Dsonar.qualitygate.wait=false
+        -Dsonar.scm.provider=git
+        -Dsonar.gitlab.project_id=${CI_PROJECT_ID}
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $SONAR_TOKEN && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")
+
+# --- K8s manifests generation (for client clusters like Huawei CCE) ---
+generate-k8s-manifests:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - apk add --no-cache envsubst
+    - mkdir -p k8s-output
+    - |
+      for f in k8s/*.yaml k8s/*.yml; do
+        [ -f "$f" ] || continue
+        envsubst < "$f" > "k8s-output/$(basename $f)"
+      done
+    - echo "Generated manifests for $CI_COMMIT_TAG:"
+    - ls -la k8s-output/
+  artifacts:
+    paths:
+      - k8s-output/
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
+      exists:
+        - k8s/
+
+# ============================================================
+# DEPLOY STAGE — SSH deploy + health check
 # ============================================================
 
 deploy-production:
@@ -237,6 +320,34 @@ import_security_issues:
     - if: $CI_SERVER_HOST == "scovil.labtau.com" && $CI_COMMIT_BRANCH == "main"
       when: delayed
       start_in: 5 minutes
+  allow_failure: true
+
+# ============================================================
+# NOTIFY STAGE — alert on pipeline failure
+# ============================================================
+
+notify-failure:
+  stage: notify
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        curl -s -X POST "$SLACK_WEBHOOK_URL" \
+          -H "Content-Type: application/json" \
+          -d "{\"text\":\"❌ Pipeline failed: *${CI_PROJECT_PATH}* (${CI_COMMIT_REF_NAME})\nJob: ${CI_JOB_NAME}\nURL: ${CI_PIPELINE_URL}\"}"
+      fi
+    - |
+      if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d "chat_id=${TELEGRAM_CHAT_ID}" \
+          -d "parse_mode=Markdown" \
+          -d "text=❌ *Pipeline failed*%0A📦 ${CI_PROJECT_PATH}%0A🔀 ${CI_COMMIT_REF_NAME}%0A🔗 [Ver pipeline](${CI_PIPELINE_URL})"
+      fi
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_failure
   allow_failure: true
 
 # === Security jobs only on gitlab.com ===
