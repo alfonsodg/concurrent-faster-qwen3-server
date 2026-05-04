@@ -153,8 +153,24 @@ vitest:
         - vite.config.ts
 
 # ============================================================
-# BUILD STAGE — Docker image on tag
+# BUILD STAGE — Docker image on tag + auto-changelog
 # ============================================================
+
+changelog:
+  stage: build
+  image: alpine:latest
+  script:
+    - apk add --no-cache git curl
+    - curl -sSL https://github.com/orhun/git-cliff/releases/latest/download/git-cliff-x86_64-unknown-linux-musl.tar.gz | tar xz
+    - ./git-cliff -o CHANGELOG.md --tag $CI_COMMIT_TAG
+    - echo "Generated changelog for $CI_COMMIT_TAG"
+    - cat CHANGELOG.md | head -30
+  artifacts:
+    paths:
+      - CHANGELOG.md
+    expire_in: 90 days
+  rules:
+    - if: $CI_COMMIT_TAG && $CI_COMMIT_TAG_MESSAGE != "deploy"
 
 build-container:
   stage: build
@@ -213,6 +229,55 @@ sonarqube:
     - if: $CI_COMMIT_TAG
       when: never
     - if: $SONAR_TOKEN && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")
+
+import_sonar_issues:
+  stage: security
+  image: alpine:latest
+  allow_failure: true
+  script:
+    - apk add --no-cache curl jq
+    - |
+      PROJECT_KEY="${CI_PROJECT_PATH_SLUG}"
+      PAGE=1
+      CREATED=0
+      SKIPPED=0
+      while true; do
+        RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" \
+          "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&resolved=false&severities=BLOCKER,CRITICAL&types=BUG,VULNERABILITY&ps=100&p=${PAGE}")
+        TOTAL=$(echo "$RESPONSE" | jq -r '.total')
+        [ "$TOTAL" = "0" ] && echo "No BLOCKER/CRITICAL issues found" && exit 0
+        echo "$RESPONSE" | jq -c '.issues[]' | while read -r ISSUE; do
+          RULE=$(echo "$ISSUE" | jq -r '.rule')
+          MSG=$(echo "$ISSUE" | jq -r '.message')
+          SEV=$(echo "$ISSUE" | jq -r '.severity')
+          TYPE=$(echo "$ISSUE" | jq -r '.type')
+          FILE=$(echo "$ISSUE" | jq -r '.component' | sed "s|${PROJECT_KEY}:||")
+          LINE=$(echo "$ISSUE" | jq -r '.line // "?"')
+          TITLE="[SonarQube ${SEV}] ${TYPE}: ${MSG}"
+          TITLE_SHORT=$(echo "$TITLE" | head -c 200)
+          EXISTING=$(curl -s -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues?search=$(echo "$RULE" | jq -Rr @uri)&state=opened&per_page=1" | jq 'length')
+          if [ "$EXISTING" -gt 0 ]; then
+            SKIPPED=$((SKIPPED + 1))
+            continue
+          fi
+          BODY="## SonarQube Finding\n\n- **Rule**: ${RULE}\n- **Severity**: ${SEV}\n- **Type**: ${TYPE}\n- **File**: \`${FILE}:${LINE}\`\n- **Message**: ${MSG}\n\n[View in SonarQube](${SONAR_HOST_URL}/project/issues?id=${PROJECT_KEY}&open=$(echo "$ISSUE" | jq -r '.key'))"
+          curl -s -o /dev/null -X POST -H "PRIVATE-TOKEN: ${CI_PERSONAL_TOKEN}" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues" \
+            --data-urlencode "title=${TITLE_SHORT}" \
+            --data-urlencode "description=${BODY}" \
+            -d "labels=sonarqube,auto-generated,priority::high"
+          CREATED=$((CREATED + 1))
+        done
+        PAGES=$(( (TOTAL + 99) / 100 ))
+        [ "$PAGE" -ge "$PAGES" ] && break
+        PAGE=$((PAGE + 1))
+      done
+      echo "Created: ${CREATED}, Skipped (duplicates): ${SKIPPED}"
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $SONAR_TOKEN && $CI_PERSONAL_TOKEN && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")
 
 # --- K8s manifests generation (for client clusters like Huawei CCE) ---
 generate-k8s-manifests:
