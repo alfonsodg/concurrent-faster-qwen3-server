@@ -61,3 +61,9 @@ debug/
 reference/
 todo
 todo.json
+DEVELOPMENT.md
+TTS_BACKEND_PORTABILITY_PLAN.md
+CLAUDE.md
+todo.json
+qwen3-tts-server-*
+bench_*-flash
